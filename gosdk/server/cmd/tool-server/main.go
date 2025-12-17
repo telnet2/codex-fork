@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/anthropics/codex-fork/gosdk/server/internal/api"
+	"github.com/anthropics/codex-fork/gosdk/server/internal/executor"
 	"github.com/anthropics/codex-fork/gosdk/server/internal/session"
 )
 
@@ -39,6 +40,10 @@ func main() {
 		log.Fatalf("Failed to create session manager: %v", err)
 	}
 
+	// Create executor with tool registry
+	exec := executor.NewExecutor(sessionManager.Storage())
+	log.Printf("Registered %d tools", len(exec.GetRegistry().GetTools()))
+
 	// Create and configure server
 	cfg := &api.Config{
 		Host:           *host,
@@ -47,7 +52,7 @@ func main() {
 		SessionTimeout: *sessionTimeout,
 	}
 
-	server := api.NewServer(cfg, sessionManager)
+	server := api.NewServer(cfg, sessionManager, exec)
 
 	// Handle graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
