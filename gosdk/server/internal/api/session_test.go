@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"os"
 	"testing"
 	"time"
 
+	"github.com/anthropics/codex-fork/gosdk/server/internal/executor"
 	"github.com/anthropics/codex-fork/gosdk/server/internal/session"
 	"github.com/anthropics/codex-fork/gosdk/server/pkg/types"
 	"github.com/cloudwego/hertz/pkg/common/ut"
@@ -21,6 +23,8 @@ func setupTestServer(t *testing.T) *Server {
 	sessionManager, err := session.NewManager(tempDir, time.Hour)
 	require.NoError(t, err)
 
+	exec := executor.NewExecutor(sessionManager.Storage())
+
 	cfg := &Config{
 		Host:           "127.0.0.1",
 		Port:           0, // Random port
@@ -28,7 +32,7 @@ func setupTestServer(t *testing.T) *Server {
 		SessionTimeout: 1,
 	}
 
-	return NewServer(cfg, sessionManager)
+	return NewServer(cfg, sessionManager, exec)
 }
 
 func TestHealthEndpoint(t *testing.T) {
@@ -235,20 +239,60 @@ func TestListToolsEndpoint(t *testing.T) {
 	var resp ListToolsResponse
 	err := json.Unmarshal(w.Body.Bytes(), &resp)
 	require.NoError(t, err)
-	// Empty list for now (Phase 1)
-	assert.Empty(t, resp.Tools)
+	// Should have registered tools
+	assert.NotEmpty(t, resp.Tools)
+	// Verify some known tools exist
+	toolNames := make(map[string]bool)
+	for _, tool := range resp.Tools {
+		toolNames[tool.Name] = true
+	}
+	assert.True(t, toolNames["read_file"], "read_file tool should be registered")
+	assert.True(t, toolNames["list_dir"], "list_dir tool should be registered")
 }
 
-func TestInvokeToolNotImplemented(t *testing.T) {
+func TestInvokeReadFileTool(t *testing.T) {
+	server := setupTestServer(t)
+
+	// Create a test file
+	tempFile := t.TempDir() + "/test.txt"
+	err := os.WriteFile(tempFile, []byte("Hello, World!"), 0644)
+	require.NoError(t, err)
+
+	// Invoke read_file tool
+	body := bytes.NewBufferString(`{"arguments": {"file_path": "` + tempFile + `"}}`)
+	w := ut.PerformRequest(server.Hertz().Engine, http.MethodPost,
+		"/api/v1/tools/read_file/invoke",
+		&ut.Body{Body: body, Len: body.Len()},
+		ut.Header{Key: "Content-Type", Value: "application/json"})
+
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var resp types.InvokeToolResponse
+	err = json.Unmarshal(w.Body.Bytes(), &resp)
+	require.NoError(t, err)
+	assert.NotEmpty(t, resp.SessionID)
+	assert.NotEmpty(t, resp.ExecutionID)
+	assert.NotNil(t, resp.Execution)
+	assert.Equal(t, types.ExecutionStatusCompleted, resp.Execution.Status)
+}
+
+func TestInvokeUnknownTool(t *testing.T) {
 	server := setupTestServer(t)
 
 	body := bytes.NewBufferString(`{"arguments": {}}`)
 	w := ut.PerformRequest(server.Hertz().Engine, http.MethodPost,
-		"/api/v1/tools/shell/invoke",
+		"/api/v1/tools/nonexistent_tool/invoke",
 		&ut.Body{Body: body, Len: body.Len()},
 		ut.Header{Key: "Content-Type", Value: "application/json"})
 
-	assert.Equal(t, http.StatusNotImplemented, w.Code)
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var resp types.InvokeToolResponse
+	err := json.Unmarshal(w.Body.Bytes(), &resp)
+	require.NoError(t, err)
+	assert.NotNil(t, resp.Execution)
+	assert.Equal(t, types.ExecutionStatusFailed, resp.Execution.Status)
+	assert.Contains(t, resp.Execution.Error, "unknown tool")
 }
 
 func TestConcurrentSessionCreation(t *testing.T) {

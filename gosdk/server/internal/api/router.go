@@ -4,6 +4,7 @@ package api
 import (
 	"context"
 
+	"github.com/anthropics/codex-fork/gosdk/server/internal/executor"
 	"github.com/anthropics/codex-fork/gosdk/server/internal/session"
 	"github.com/cloudwego/hertz/pkg/app/server"
 )
@@ -12,6 +13,7 @@ import (
 type Server struct {
 	hertz          *server.Hertz
 	sessionManager *session.Manager
+	executor       *executor.Executor
 }
 
 // Config holds server configuration.
@@ -23,12 +25,13 @@ type Config struct {
 }
 
 // NewServer creates a new API server.
-func NewServer(cfg *Config, sessionManager *session.Manager) *Server {
+func NewServer(cfg *Config, sessionManager *session.Manager, exec *executor.Executor) *Server {
 	h := server.Default(server.WithHostPorts(cfg.Host + ":" + itoa(cfg.Port)))
 
 	s := &Server{
 		hertz:          h,
 		sessionManager: sessionManager,
+		executor:       exec,
 	}
 
 	s.setupRoutes()
