@@ -315,3 +315,92 @@ func TestTouchSession(t *testing.T) {
 	assert.True(t, updated.ExpiresAt.After(originalExpiry), "ExpiresAt should be after original")
 	assert.True(t, updated.LastAccessAt.After(originalLastAccess), "LastAccessAt should be after original")
 }
+
+func TestStartCleanup(t *testing.T) {
+	tempDir := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Create manager with very short timeout
+	m, err := NewManager(tempDir, 10*time.Millisecond)
+	require.NoError(t, err)
+
+	// Create sessions
+	s1, err := m.CreateSession(ctx, &types.CreateSessionRequest{})
+	require.NoError(t, err)
+	s2, err := m.CreateSession(ctx, &types.CreateSessionRequest{})
+	require.NoError(t, err)
+
+	// Track cleanup callback
+	callbackCalled := make(chan struct{}, 1)
+	callback := func(deleted int) {
+		_ = deleted // Track that cleanup ran
+		select {
+		case callbackCalled <- struct{}{}:
+		default:
+		}
+	}
+
+	// Start cleanup with short interval
+	m.StartCleanup(ctx, 20*time.Millisecond, callback)
+
+	// Wait for sessions to expire and cleanup to run
+	time.Sleep(50 * time.Millisecond)
+
+	// Wait for callback
+	select {
+	case <-callbackCalled:
+		// Callback was called
+	case <-time.After(100 * time.Millisecond):
+		t.Log("Timeout waiting for cleanup callback, checking directories anyway")
+	}
+
+	// Verify directories are gone (cleanup should have run)
+	_, err = os.Stat(m.storage.SessionDir(s1.ID))
+	assert.True(t, os.IsNotExist(err), "Session 1 directory should be deleted")
+	_, err = os.Stat(m.storage.SessionDir(s2.ID))
+	assert.True(t, os.IsNotExist(err), "Session 2 directory should be deleted")
+}
+
+func TestStartCleanupCancellation(t *testing.T) {
+	tempDir := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+
+	m, err := NewManager(tempDir, time.Hour)
+	require.NoError(t, err)
+
+	cleanupCount := 0
+	callback := func(deleted int) {
+		cleanupCount++
+	}
+
+	// Start cleanup
+	m.StartCleanup(ctx, 10*time.Millisecond, callback)
+
+	// Let it run a bit
+	time.Sleep(30 * time.Millisecond)
+
+	// Cancel context
+	cancel()
+
+	// Wait a bit
+	time.Sleep(30 * time.Millisecond)
+
+	// Get current count
+	finalCount := cleanupCount
+
+	// Wait more - count should not increase after cancellation
+	time.Sleep(30 * time.Millisecond)
+
+	assert.Equal(t, finalCount, cleanupCount, "Cleanup should stop after context cancellation")
+}
+
+func TestSessionTimeout(t *testing.T) {
+	tempDir := t.TempDir()
+
+	timeout := 5 * time.Hour
+	m, err := NewManager(tempDir, timeout)
+	require.NoError(t, err)
+
+	assert.Equal(t, timeout, m.SessionTimeout())
+}

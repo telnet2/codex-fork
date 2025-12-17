@@ -543,10 +543,12 @@ async getOutput(
 4. ✅ Add SSE event types (started, stdout, stderr, completed, error)
 5. ✅ Write streaming endpoint tests
 
-### Phase 4: Session Lifecycle
-1. Implement session cleanup background job
-2. Add session expiry handling
-3. Implement execution cancellation
+### Phase 4: Session Lifecycle ✅ COMPLETE
+1. ✅ Implement session cleanup background job (StartCleanup with configurable interval)
+2. ✅ Add session expiry handling (sessions return nil when expired)
+3. ✅ Implement execution cancellation (POST /api/v1/executions/:id/cancel)
+4. ✅ Add cleanup-interval command line flag
+5. ✅ Write cleanup background job tests
 
 ### Phase 5: TypeScript Client
 1. Create npm package structure

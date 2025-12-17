@@ -322,3 +322,37 @@ func (m *Manager) withLock(ctx context.Context, lock *flock.Flock, fn func() err
 
 	return fn()
 }
+
+// CleanupCallback is called after each cleanup run with the number of sessions deleted.
+type CleanupCallback func(deleted int)
+
+// StartCleanup starts a background goroutine that periodically cleans up expired sessions.
+// The cleanup runs at the specified interval until the context is cancelled.
+// An optional callback can be provided to be notified after each cleanup run.
+func (m *Manager) StartCleanup(ctx context.Context, interval time.Duration, callback CleanupCallback) {
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				deleted, err := m.CleanupExpiredSessions(ctx)
+				if err != nil {
+					// Log error but continue (in production, use proper logging)
+					continue
+				}
+				if callback != nil {
+					callback(deleted)
+				}
+			}
+		}
+	}()
+}
+
+// SessionTimeout returns the configured session timeout duration.
+func (m *Manager) SessionTimeout() time.Duration {
+	return m.sessionTimeout
+}
