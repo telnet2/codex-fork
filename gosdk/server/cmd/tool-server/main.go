@@ -22,6 +22,7 @@ func main() {
 	port := flag.Int("port", 8080, "Port to listen on")
 	tempDir := flag.String("temp-dir", "", "Base temporary directory (default: system temp)")
 	sessionTimeout := flag.Int("session-timeout", 72, "Session timeout in hours")
+	cleanupInterval := flag.Int("cleanup-interval", 60, "Cleanup interval in minutes")
 	flag.Parse()
 
 	// Determine temp directory
@@ -33,6 +34,7 @@ func main() {
 	log.Printf("Starting tool server on %s:%d", *host, *port)
 	log.Printf("Using base directory: %s", baseDir)
 	log.Printf("Session timeout: %d hours", *sessionTimeout)
+	log.Printf("Cleanup interval: %d minutes", *cleanupInterval)
 
 	// Create session manager
 	sessionManager, err := session.NewManager(baseDir, time.Duration(*sessionTimeout)*time.Hour)
@@ -57,6 +59,14 @@ func main() {
 	// Handle graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Start session cleanup background job
+	sessionManager.StartCleanup(ctx, time.Duration(*cleanupInterval)*time.Minute, func(deleted int) {
+		if deleted > 0 {
+			log.Printf("Cleaned up %d expired sessions", deleted)
+		}
+	})
+	log.Printf("Started session cleanup background job")
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
