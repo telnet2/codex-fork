@@ -6,6 +6,7 @@ require (
 	github.com/anthropics/codex-fork/gosdk v0.0.0
 	github.com/cloudwego/hertz v0.9.3
 	github.com/gofrs/flock v0.12.1
+	github.com/hertz-contrib/sse v0.0.4
 	github.com/oklog/ulid/v2 v2.1.0
 	github.com/stretchr/testify v1.9.0
 )

@@ -56,14 +56,15 @@ func (s *Server) setupRoutes() {
 			sessions.PUT("/:id/cwd", s.updateCwd)
 		}
 
-		// Tool endpoints (placeholder for Phase 2)
+		// Tool endpoints
 		tools := v1.Group("/tools")
 		{
 			tools.GET("", s.listTools)
 			tools.POST("/:name/invoke", s.invokeTool)
+			tools.POST("/:name/invoke/stream", s.invokeToolStream)
 		}
 
-		// Execution endpoints (placeholder for Phase 2)
+		// Execution endpoints
 		executions := v1.Group("/executions")
 		{
 			executions.GET("/:id", s.getExecution)
