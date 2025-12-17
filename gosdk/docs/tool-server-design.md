@@ -57,9 +57,23 @@ This document describes the design for a Go-based Tool Server that exposes the g
 
 - **HTTP Framework**: [cloudwego/hertz](https://github.com/cloudwego/hertz) - High-performance Go HTTP framework
 - **SSE**: [hertz SSE extension](https://www.cloudwego.io/docs/hertz/tutorials/basic-feature/sse/) for streaming
-- **UUID**: `github.com/google/uuid` for session/execution IDs
+- **ULID**: `github.com/oklog/ulid/v2` for session/execution IDs (monotonically increasing)
 - **File locking**: `github.com/gofrs/flock` for concurrent session access
 - **JSON**: Standard library `encoding/json`
+
+### Why ULID over UUID?
+
+[ULID](https://github.com/ulid/spec) (Universally Unique Lexicographically Sortable Identifier) provides:
+
+1. **Monotonically increasing**: IDs generated in sequence are naturally ordered by creation time
+2. **Lexicographically sortable**: Directory listings and database queries return chronological order
+3. **Timestamp embedded**: First 48 bits encode millisecond timestamp (extractable)
+4. **UUID compatible**: 128-bit, can be stored in UUID columns
+5. **URL safe**: Base32 encoding (26 characters, no special chars)
+
+Example: `01ARZ3NDEKTSV4RRFFQ69G5FAV`
+- Timestamp: `01ARZ3NDEK` (first 10 chars)
+- Randomness: `TSV4RRFFQ69G5FAV` (last 16 chars)
 
 ## Data Models
 
@@ -184,7 +198,7 @@ When streaming execution output, the server sends the following SSE events:
 
 ```
 event: started
-data: {"execution_id": "exec-123", "started_at": "..."}
+data: {"execution_id": "01HX9Z3NDEKTSV4RRFFQ69G5FA", "started_at": "2024-05-15T10:30:00Z"}
 
 event: stdout
 data: {"chunk": "base64-encoded-data", "offset": 0}
@@ -193,11 +207,14 @@ event: stderr
 data: {"chunk": "base64-encoded-data", "offset": 0}
 
 event: completed
-data: {"execution_id": "exec-123", "exit_code": 0, "duration_ms": 1234}
+data: {"execution_id": "01HX9Z3NDEKTSV4RRFFQ69G5FA", "exit_code": 0, "duration_ms": 1234}
 
 event: error
-data: {"execution_id": "exec-123", "error": "command not found"}
+data: {"execution_id": "01HX9Z3NDEKTSV4RRFFQ69G5FA", "error": "command not found"}
 ```
+
+> **Note**: Execution IDs are ULIDs (e.g., `01HX9Z3NDEKTSV4RRFFQ69G5FA`), which are monotonically
+> increasing and sortable. The timestamp can be extracted from the first 10 characters.
 
 ## File System Layout
 
@@ -283,10 +300,28 @@ func (sm *SessionManager) cleanupExpiredSessions() {
 ## Tool Execution Flow
 
 ```go
+import (
+    "github.com/oklog/ulid/v2"
+    "crypto/rand"
+    "sync"
+)
+
+var (
+    entropy     = ulid.Monotonic(rand.Reader, 0)
+    entropyLock sync.Mutex
+)
+
+// NewULID generates a new monotonically increasing ULID
+func NewULID() string {
+    entropyLock.Lock()
+    defer entropyLock.Unlock()
+    return ulid.MustNew(ulid.Timestamp(time.Now()), entropy).String()
+}
+
 func (e *Executor) Execute(ctx context.Context, session *Session, req *InvokeToolRequest) (*Execution, error) {
-    // 1. Create execution record
+    // 1. Create execution record with monotonic ULID
     exec := &Execution{
-        ID:        uuid.NewString(),
+        ID:        NewULID(),
         SessionID: session.ID,
         ToolName:  req.ToolName,
         Arguments: req.Arguments,
@@ -332,6 +367,19 @@ func (e *Executor) Execute(ctx context.Context, session *Session, req *InvokeToo
 ```
 
 ## TypeScript Client Design
+
+### Dependencies
+
+```json
+{
+  "dependencies": {
+    "ulid": "^2.3.0"
+  }
+}
+```
+
+The client uses [ulid](https://www.npmjs.com/package/ulid) for client-side ID generation when needed,
+matching the server's ULID format.
 
 ### Client Interface
 
