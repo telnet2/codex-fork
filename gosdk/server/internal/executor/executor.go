@@ -12,6 +12,7 @@ import (
 
 	"github.com/anthropics/codex-fork/gosdk/handlers"
 	"github.com/anthropics/codex-fork/gosdk/server/internal/session"
+	sseutil "github.com/anthropics/codex-fork/gosdk/server/internal/sse"
 	"github.com/anthropics/codex-fork/gosdk/server/pkg/types"
 	"github.com/anthropics/codex-fork/gosdk/tools"
 )
@@ -166,6 +167,160 @@ func (e *Executor) Execute(ctx context.Context, sess *types.Session, req *types.
 	// Save final execution state
 	if err := e.storage.SaveExecution(exec); err != nil {
 		return nil, fmt.Errorf("failed to save execution: %w", err)
+	}
+
+	return exec, nil
+}
+
+// ExecuteStreaming runs a tool and streams progress via SSE.
+func (e *Executor) ExecuteStreaming(ctx context.Context, sess *types.Session, req *types.InvokeToolRequest, streamer *sseutil.Streamer) (*types.Execution, error) {
+	// Create execution record
+	now := time.Now()
+	exec := &types.Execution{
+		ID:          types.NewULID(),
+		SessionID:   sess.ID,
+		ToolName:    req.ToolName,
+		Arguments:   req.Arguments,
+		Status:      types.ExecutionStatusPending,
+		StartedAt:   now,
+		StdoutBytes: 0,
+		StderrBytes: 0,
+	}
+
+	// Create execution directory
+	if err := e.storage.CreateExecutionDir(sess.ID, exec.ID); err != nil {
+		return nil, fmt.Errorf("failed to create execution directory: %w", err)
+	}
+
+	// Save initial execution state
+	if err := e.storage.SaveExecution(exec); err != nil {
+		return nil, fmt.Errorf("failed to save execution: %w", err)
+	}
+
+	// Send started event
+	if err := streamer.SendStarted(&sseutil.StartedEvent{
+		ExecutionID: exec.ID,
+		SessionID:   sess.ID,
+		ToolName:    req.ToolName,
+		StartedAt:   now,
+	}); err != nil {
+		return nil, fmt.Errorf("failed to send started event: %w", err)
+	}
+
+	// Get the tool handler
+	handler, ok := e.registry.GetHandler(req.ToolName)
+	if !ok {
+		handler = e.createDynamicHandler(req.ToolName, sess)
+		if handler == nil {
+			exec.Status = types.ExecutionStatusFailed
+			exec.Error = fmt.Sprintf("unknown tool or no handler: %s", req.ToolName)
+			e.storage.SaveExecution(exec)
+
+			completedAt := time.Now()
+			exec.CompletedAt = &completedAt
+			durationMs := completedAt.Sub(now).Milliseconds()
+
+			streamer.SendError(&sseutil.ErrorEvent{
+				ExecutionID: exec.ID,
+				Error:       exec.Error,
+				DurationMs:  durationMs,
+			})
+			return exec, nil
+		}
+	}
+
+	// Create cancellable context
+	execCtx, cancel := context.WithCancel(ctx)
+	e.mu.Lock()
+	e.running[exec.ID] = cancel
+	e.mu.Unlock()
+
+	defer func() {
+		e.mu.Lock()
+		delete(e.running, exec.ID)
+		e.mu.Unlock()
+	}()
+
+	// Update status to running
+	exec.Status = types.ExecutionStatusRunning
+	e.storage.SaveExecution(exec)
+
+	// Execute the tool
+	var output *tools.ToolOutput
+	var execErr error
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		output, execErr = handler.Handle(string(req.Arguments))
+	}()
+
+	select {
+	case <-execCtx.Done():
+		exec.Status = types.ExecutionStatusCancelled
+		exec.Error = "execution cancelled"
+	case <-streamer.Done():
+		// Client disconnected
+		cancel()
+		exec.Status = types.ExecutionStatusCancelled
+		exec.Error = "client disconnected"
+	case <-done:
+		if execErr != nil {
+			exec.Status = types.ExecutionStatusFailed
+			exec.Error = execErr.Error()
+		} else if output != nil {
+			// Write output to files
+			if err := e.writeOutput(sess.ID, exec.ID, output); err != nil {
+				exec.Status = types.ExecutionStatusFailed
+				exec.Error = fmt.Sprintf("failed to write output: %v", err)
+			} else {
+				// Check success flag
+				if output.Success != nil && !*output.Success {
+					exec.Status = types.ExecutionStatusFailed
+				} else {
+					exec.Status = types.ExecutionStatusCompleted
+					exitCode := 0
+					exec.ExitCode = &exitCode
+				}
+				exec.StdoutBytes = int64(len(output.Content))
+
+				// Stream the output content
+				if len(output.Content) > 0 {
+					streamer.SendStdout(exec.ID, []byte(output.Content), 0)
+				}
+			}
+		}
+	}
+
+	// Update completion time
+	completedAt := time.Now()
+	exec.CompletedAt = &completedAt
+	durationMs := completedAt.Sub(now).Milliseconds()
+
+	// Save final execution state
+	if err := e.storage.SaveExecution(exec); err != nil {
+		return nil, fmt.Errorf("failed to save execution: %w", err)
+	}
+
+	// Send completion/error event
+	if exec.Status == types.ExecutionStatusCompleted {
+		exitCode := 0
+		if exec.ExitCode != nil {
+			exitCode = *exec.ExitCode
+		}
+		streamer.SendCompleted(&sseutil.CompletedEvent{
+			ExecutionID: exec.ID,
+			ExitCode:    exitCode,
+			DurationMs:  durationMs,
+			StdoutBytes: exec.StdoutBytes,
+			StderrBytes: exec.StderrBytes,
+		})
+	} else {
+		streamer.SendError(&sseutil.ErrorEvent{
+			ExecutionID: exec.ID,
+			Error:       exec.Error,
+			DurationMs:  durationMs,
+		})
 	}
 
 	return exec, nil

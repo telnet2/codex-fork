@@ -536,10 +536,12 @@ async getOutput(
 4. ✅ Implement output pagination
 5. ✅ Write tool execution tests
 
-### Phase 3: Streaming
-1. Add SSE support using hertz SSE extension
-2. Implement streaming tool invocation
-3. Add real-time stdout/stderr streaming
+### Phase 3: Streaming ✅ COMPLETE
+1. ✅ Add SSE support using hertz SSE extension
+2. ✅ Implement streaming tool invocation endpoint (POST /api/v1/tools/:name/invoke/stream)
+3. ✅ Add real-time stdout/stderr streaming via SSE events
+4. ✅ Add SSE event types (started, stdout, stderr, completed, error)
+5. ✅ Write streaming endpoint tests
 
 ### Phase 4: Session Lifecycle
 1. Implement session cleanup background job
