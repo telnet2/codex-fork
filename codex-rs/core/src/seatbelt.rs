@@ -1,24 +1,40 @@
 #![cfg(target_os = "macos")]
 
+use codex_network_proxy::NetworkProxy;
+use codex_network_proxy::PROXY_URL_ENV_KEYS;
+use codex_network_proxy::has_proxy_url_env_vars;
+use codex_network_proxy::proxy_url_env_value;
+use codex_utils_absolute_path::AbsolutePathBuf;
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::path::Path;
 use std::path::PathBuf;
 use tokio::process::Child;
+use tracing::warn;
+use url::Url;
 
 use crate::protocol::SandboxPolicy;
+use crate::seatbelt_permissions::MacOsSeatbeltProfileExtensions;
+use crate::seatbelt_permissions::build_seatbelt_extensions;
 use crate::spawn::CODEX_SANDBOX_ENV_VAR;
+use crate::spawn::SpawnChildRequest;
 use crate::spawn::StdioPolicy;
 use crate::spawn::spawn_child_async;
+use codex_protocol::permissions::FileSystemSandboxPolicy;
+use codex_protocol::permissions::NetworkSandboxPolicy;
 
 const MACOS_SEATBELT_BASE_POLICY: &str = include_str!("seatbelt_base_policy.sbpl");
 const MACOS_SEATBELT_NETWORK_POLICY: &str = include_str!("seatbelt_network_policy.sbpl");
+const MACOS_RESTRICTED_READ_ONLY_PLATFORM_DEFAULTS: &str =
+    include_str!("restricted_read_only_platform_defaults.sbpl");
 
 /// When working with `sandbox-exec`, only consider `sandbox-exec` in `/usr/bin`
 /// to defend against an attacker trying to inject a malicious version on the
 /// PATH. If /usr/bin/sandbox-exec has been tampered with, then the attacker
 /// already has root access.
-pub(crate) const MACOS_PATH_TO_SEATBELT_EXECUTABLE: &str = "/usr/bin/sandbox-exec";
+pub const MACOS_PATH_TO_SEATBELT_EXECUTABLE: &str = "/usr/bin/sandbox-exec";
 
 pub async fn spawn_command_under_seatbelt(
     command: Vec<String>,
@@ -26,103 +42,516 @@ pub async fn spawn_command_under_seatbelt(
     sandbox_policy: &SandboxPolicy,
     sandbox_policy_cwd: &Path,
     stdio_policy: StdioPolicy,
+    network: Option<&NetworkProxy>,
     mut env: HashMap<String, String>,
 ) -> std::io::Result<Child> {
-    let args = create_seatbelt_command_args(command, sandbox_policy, sandbox_policy_cwd);
+    let args = create_seatbelt_command_args(
+        command,
+        sandbox_policy,
+        sandbox_policy_cwd,
+        /*enforce_managed_network*/ false,
+        network,
+    );
     let arg0 = None;
     env.insert(CODEX_SANDBOX_ENV_VAR.to_string(), "seatbelt".to_string());
-    spawn_child_async(
-        PathBuf::from(MACOS_PATH_TO_SEATBELT_EXECUTABLE),
+    spawn_child_async(SpawnChildRequest {
+        program: PathBuf::from(MACOS_PATH_TO_SEATBELT_EXECUTABLE),
         args,
         arg0,
-        command_cwd,
-        sandbox_policy,
+        cwd: command_cwd,
+        network_sandbox_policy: NetworkSandboxPolicy::from(sandbox_policy),
+        network,
         stdio_policy,
         env,
-    )
+    })
     .await
 }
 
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
+}
+
+fn proxy_scheme_default_port(scheme: &str) -> u16 {
+    match scheme {
+        "https" => 443,
+        "socks5" | "socks5h" | "socks4" | "socks4a" => 1080,
+        _ => 80,
+    }
+}
+
+fn proxy_loopback_ports_from_env(env: &HashMap<String, String>) -> Vec<u16> {
+    let mut ports = BTreeSet::new();
+    for key in PROXY_URL_ENV_KEYS {
+        let Some(proxy_url) = proxy_url_env_value(env, key) else {
+            continue;
+        };
+        let trimmed = proxy_url.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let candidate = if trimmed.contains("://") {
+            trimmed.to_string()
+        } else {
+            format!("http://{trimmed}")
+        };
+        let Ok(parsed) = Url::parse(&candidate) else {
+            continue;
+        };
+        let Some(host) = parsed.host_str() else {
+            continue;
+        };
+        if !is_loopback_host(host) {
+            continue;
+        }
+
+        let scheme = parsed.scheme().to_ascii_lowercase();
+        let port = parsed
+            .port()
+            .unwrap_or_else(|| proxy_scheme_default_port(scheme.as_str()));
+        ports.insert(port);
+    }
+    ports.into_iter().collect()
+}
+
+#[derive(Debug, Default)]
+struct ProxyPolicyInputs {
+    ports: Vec<u16>,
+    has_proxy_config: bool,
+    allow_local_binding: bool,
+    unix_domain_socket_policy: UnixDomainSocketPolicy,
+}
+
+#[derive(Debug, Clone)]
+// Keep allow-all and allowlist modes disjoint so we don't carry ignored state.
+enum UnixDomainSocketPolicy {
+    AllowAll,
+    Restricted { allowed: Vec<AbsolutePathBuf> },
+}
+
+impl Default for UnixDomainSocketPolicy {
+    fn default() -> Self {
+        Self::Restricted { allowed: vec![] }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct UnixSocketPathParam {
+    index: usize,
+    path: AbsolutePathBuf,
+}
+
+fn proxy_policy_inputs(network: Option<&NetworkProxy>) -> ProxyPolicyInputs {
+    if let Some(network) = network {
+        let mut env = HashMap::new();
+        network.apply_to_env(&mut env);
+        let unix_domain_socket_policy = if network.dangerously_allow_all_unix_sockets() {
+            UnixDomainSocketPolicy::AllowAll
+        } else {
+            let allowed = network
+                .allow_unix_sockets()
+                .iter()
+                .filter_map(
+                    |socket_path| match normalize_path_for_sandbox(Path::new(socket_path)) {
+                        Some(path) => Some((path.to_string_lossy().to_string(), path)),
+                        None => {
+                            warn!(
+                                "ignoring network.allow_unix_sockets entry because it could not be normalized: {socket_path}"
+                            );
+                            None
+                        }
+                    },
+                )
+                .collect::<BTreeMap<_, _>>()
+                .into_values()
+                .collect();
+            UnixDomainSocketPolicy::Restricted { allowed }
+        };
+        return ProxyPolicyInputs {
+            ports: proxy_loopback_ports_from_env(&env),
+            has_proxy_config: has_proxy_url_env_vars(&env),
+            allow_local_binding: network.allow_local_binding(),
+            unix_domain_socket_policy,
+        };
+    }
+
+    ProxyPolicyInputs::default()
+}
+
+fn normalize_path_for_sandbox(path: &Path) -> Option<AbsolutePathBuf> {
+    // `AbsolutePathBuf::from_absolute_path()` normalizes relative paths against the current
+    // working directory, so keep the explicit check to avoid silently accepting relative entries.
+    if !path.is_absolute() {
+        return None;
+    }
+
+    let absolute_path = AbsolutePathBuf::from_absolute_path(path).ok()?;
+    let normalized_path = absolute_path
+        .as_path()
+        .canonicalize()
+        .ok()
+        .and_then(|canonical_path| AbsolutePathBuf::from_absolute_path(canonical_path).ok());
+    normalized_path.or(Some(absolute_path))
+}
+
+fn unix_socket_path_params(proxy: &ProxyPolicyInputs) -> Vec<UnixSocketPathParam> {
+    let mut deduped_paths: BTreeMap<String, AbsolutePathBuf> = BTreeMap::new();
+    let UnixDomainSocketPolicy::Restricted { allowed } = &proxy.unix_domain_socket_policy else {
+        return vec![];
+    };
+    for path in allowed {
+        deduped_paths
+            .entry(path.to_string_lossy().to_string())
+            .or_insert_with(|| path.clone());
+    }
+
+    deduped_paths
+        .into_values()
+        .enumerate()
+        .map(|(index, path)| UnixSocketPathParam { index, path })
+        .collect()
+}
+
+fn unix_socket_path_param_key(index: usize) -> String {
+    format!("UNIX_SOCKET_PATH_{index}")
+}
+
+fn unix_socket_dir_params(proxy: &ProxyPolicyInputs) -> Vec<(String, PathBuf)> {
+    unix_socket_path_params(proxy)
+        .into_iter()
+        .map(|param| {
+            (
+                unix_socket_path_param_key(param.index),
+                param.path.into_path_buf(),
+            )
+        })
+        .collect()
+}
+
+/// Returns zero or more complete Seatbelt policy lines for unix socket rules.
+/// When non-empty, the returned string is newline-terminated so callers can
+/// append it directly to larger policy blocks.
+fn unix_socket_policy(proxy: &ProxyPolicyInputs) -> String {
+    let socket_params = unix_socket_path_params(proxy);
+    let has_unix_socket_access = matches!(
+        proxy.unix_domain_socket_policy,
+        UnixDomainSocketPolicy::AllowAll
+    ) || !socket_params.is_empty();
+    if !has_unix_socket_access {
+        return String::new();
+    }
+
+    let mut policy = String::new();
+    policy.push_str("(allow system-socket (socket-domain AF_UNIX))\n");
+    if matches!(
+        proxy.unix_domain_socket_policy,
+        UnixDomainSocketPolicy::AllowAll
+    ) {
+        // Keep AllowAll genuinely broad here; path qualifiers look narrower
+        // without a clear macOS behavioral benefit.
+        policy.push_str("(allow network-bind (local unix-socket))\n");
+        policy.push_str("(allow network-outbound (remote unix-socket))\n");
+        return policy;
+    }
+
+    for param in socket_params {
+        let key = unix_socket_path_param_key(param.index);
+        // Use subpath so allowlists cover sockets created beneath approved directories.
+        policy.push_str(&format!(
+            "(allow network-bind (local unix-socket (subpath (param \"{key}\"))))\n"
+        ));
+        policy.push_str(&format!(
+            "(allow network-outbound (remote unix-socket (subpath (param \"{key}\"))))\n"
+        ));
+    }
+    policy
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn dynamic_network_policy(
+    sandbox_policy: &SandboxPolicy,
+    enforce_managed_network: bool,
+    proxy: &ProxyPolicyInputs,
+) -> String {
+    dynamic_network_policy_for_network(
+        NetworkSandboxPolicy::from(sandbox_policy),
+        enforce_managed_network,
+        proxy,
+    )
+}
+
+fn dynamic_network_policy_for_network(
+    network_policy: NetworkSandboxPolicy,
+    enforce_managed_network: bool,
+    proxy: &ProxyPolicyInputs,
+) -> String {
+    let should_use_restricted_network_policy =
+        !proxy.ports.is_empty() || proxy.has_proxy_config || enforce_managed_network;
+    if should_use_restricted_network_policy {
+        let mut policy = String::new();
+        if proxy.allow_local_binding {
+            policy.push_str("; allow loopback local binding and loopback traffic\n");
+            policy.push_str("(allow network-bind (local ip \"localhost:*\"))\n");
+            policy.push_str("(allow network-inbound (local ip \"localhost:*\"))\n");
+            policy.push_str("(allow network-outbound (remote ip \"localhost:*\"))\n");
+        }
+        for port in &proxy.ports {
+            policy.push_str(&format!(
+                "(allow network-outbound (remote ip \"localhost:{port}\"))\n"
+            ));
+        }
+        let unix_socket_policy = unix_socket_policy(proxy);
+        if !unix_socket_policy.is_empty() {
+            policy.push_str("; allow unix domain sockets for local IPC\n");
+            policy.push_str(&unix_socket_policy);
+        }
+        return format!("{policy}{MACOS_SEATBELT_NETWORK_POLICY}");
+    }
+
+    if proxy.has_proxy_config {
+        // Proxy configuration is present but we could not infer any valid loopback endpoints.
+        // Fail closed to avoid silently widening network access in proxy-enforced sessions.
+        return String::new();
+    }
+
+    if enforce_managed_network {
+        // Managed network requirements are active but no usable proxy endpoints
+        // are available. Fail closed for network access.
+        return String::new();
+    }
+
+    if network_policy.is_enabled() {
+        // No proxy env is configured: retain the existing full-network behavior.
+        format!(
+            "(allow network-outbound)\n(allow network-inbound)\n{MACOS_SEATBELT_NETWORK_POLICY}"
+        )
+    } else {
+        String::new()
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn create_seatbelt_command_args(
     command: Vec<String>,
     sandbox_policy: &SandboxPolicy,
     sandbox_policy_cwd: &Path,
+    enforce_managed_network: bool,
+    network: Option<&NetworkProxy>,
 ) -> Vec<String> {
-    let (file_write_policy, file_write_dir_params) = {
-        if sandbox_policy.has_full_disk_write_access() {
-            // Allegedly, this is more permissive than `(allow file-write*)`.
-            (
-                r#"(allow file-write* (regex #"^/"))"#.to_string(),
-                Vec::new(),
-            )
-        } else {
-            let writable_roots = sandbox_policy.get_writable_roots_with_cwd(sandbox_policy_cwd);
+    create_seatbelt_command_args_with_extensions(
+        command,
+        sandbox_policy,
+        sandbox_policy_cwd,
+        enforce_managed_network,
+        network,
+        /*extensions*/ None,
+    )
+}
 
-            let mut writable_folder_policies: Vec<String> = Vec::new();
-            let mut file_write_params = Vec::new();
+fn root_absolute_path() -> AbsolutePathBuf {
+    match AbsolutePathBuf::from_absolute_path(Path::new("/")) {
+        Ok(path) => path,
+        Err(err) => panic!("root path must be absolute: {err}"),
+    }
+}
 
-            for (index, wr) in writable_roots.iter().enumerate() {
-                // Canonicalize to avoid mismatches like /var vs /private/var on macOS.
-                let canonical_root = wr
-                    .root
-                    .as_path()
-                    .canonicalize()
-                    .unwrap_or_else(|_| wr.root.to_path_buf());
-                let root_param = format!("WRITABLE_ROOT_{index}");
-                file_write_params.push((root_param.clone(), canonical_root));
+#[derive(Debug, Clone)]
+struct SeatbeltAccessRoot {
+    root: AbsolutePathBuf,
+    excluded_subpaths: Vec<AbsolutePathBuf>,
+}
 
-                if wr.read_only_subpaths.is_empty() {
-                    writable_folder_policies.push(format!("(subpath (param \"{root_param}\"))"));
-                } else {
-                    // Add parameters for each read-only subpath and generate
-                    // the `(require-not ...)` clauses.
-                    let mut require_parts: Vec<String> = Vec::new();
-                    require_parts.push(format!("(subpath (param \"{root_param}\"))"));
-                    for (subpath_index, ro) in wr.read_only_subpaths.iter().enumerate() {
-                        let canonical_ro = ro
-                            .as_path()
-                            .canonicalize()
-                            .unwrap_or_else(|_| ro.to_path_buf());
-                        let ro_param = format!("WRITABLE_ROOT_{index}_RO_{subpath_index}");
-                        require_parts
-                            .push(format!("(require-not (subpath (param \"{ro_param}\")))"));
-                        file_write_params.push((ro_param, canonical_ro));
-                    }
-                    let policy_component = format!("(require-all {} )", require_parts.join(" "));
-                    writable_folder_policies.push(policy_component);
-                }
-            }
+fn build_seatbelt_access_policy(
+    action: &str,
+    param_prefix: &str,
+    roots: Vec<SeatbeltAccessRoot>,
+) -> (String, Vec<(String, PathBuf)>) {
+    let mut policy_components = Vec::new();
+    let mut params = Vec::new();
 
-            if writable_folder_policies.is_empty() {
-                ("".to_string(), Vec::new())
-            } else {
-                let file_write_policy = format!(
-                    "(allow file-write*\n{}\n)",
-                    writable_folder_policies.join(" ")
-                );
-                (file_write_policy, file_write_params)
-            }
+    for (index, access_root) in roots.into_iter().enumerate() {
+        let root =
+            normalize_path_for_sandbox(access_root.root.as_path()).unwrap_or(access_root.root);
+        let root_param = format!("{param_prefix}_{index}");
+        params.push((root_param.clone(), root.into_path_buf()));
+
+        if access_root.excluded_subpaths.is_empty() {
+            policy_components.push(format!("(subpath (param \"{root_param}\"))"));
+            continue;
         }
-    };
 
-    let file_read_policy = if sandbox_policy.has_full_disk_read_access() {
-        "; allow read-only file operations\n(allow file-read*)"
+        let mut require_parts = vec![format!("(subpath (param \"{root_param}\"))")];
+        for (excluded_index, excluded_subpath) in
+            access_root.excluded_subpaths.into_iter().enumerate()
+        {
+            let excluded_subpath =
+                normalize_path_for_sandbox(excluded_subpath.as_path()).unwrap_or(excluded_subpath);
+            let excluded_param = format!("{param_prefix}_{index}_RO_{excluded_index}");
+            params.push((excluded_param.clone(), excluded_subpath.into_path_buf()));
+            require_parts.push(format!(
+                "(require-not (subpath (param \"{excluded_param}\")))"
+            ));
+        }
+        policy_components.push(format!("(require-all {} )", require_parts.join(" ")));
+    }
+
+    if policy_components.is_empty() {
+        (String::new(), Vec::new())
     } else {
-        ""
-    };
+        (
+            format!("(allow {action}\n{}\n)", policy_components.join(" ")),
+            params,
+        )
+    }
+}
 
-    // TODO(mbolin): apply_patch calls must also honor the SandboxPolicy.
-    let network_policy = if sandbox_policy.has_full_network_access() {
-        MACOS_SEATBELT_NETWORK_POLICY
-    } else {
-        ""
-    };
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn create_seatbelt_command_args_with_extensions(
+    command: Vec<String>,
+    sandbox_policy: &SandboxPolicy,
+    sandbox_policy_cwd: &Path,
+    enforce_managed_network: bool,
+    network: Option<&NetworkProxy>,
+    extensions: Option<&MacOsSeatbeltProfileExtensions>,
+) -> Vec<String> {
+    create_seatbelt_command_args_for_policies_with_extensions(
+        command,
+        &FileSystemSandboxPolicy::from_legacy_sandbox_policy(sandbox_policy, sandbox_policy_cwd),
+        NetworkSandboxPolicy::from(sandbox_policy),
+        sandbox_policy_cwd,
+        enforce_managed_network,
+        network,
+        extensions,
+    )
+}
 
-    let full_policy = format!(
-        "{MACOS_SEATBELT_BASE_POLICY}\n{file_read_policy}\n{file_write_policy}\n{network_policy}"
+pub fn create_seatbelt_command_args_for_policies_with_extensions(
+    command: Vec<String>,
+    file_system_sandbox_policy: &FileSystemSandboxPolicy,
+    network_sandbox_policy: NetworkSandboxPolicy,
+    sandbox_policy_cwd: &Path,
+    enforce_managed_network: bool,
+    network: Option<&NetworkProxy>,
+    extensions: Option<&MacOsSeatbeltProfileExtensions>,
+) -> Vec<String> {
+    let unreadable_roots =
+        file_system_sandbox_policy.get_unreadable_roots_with_cwd(sandbox_policy_cwd);
+    let (file_write_policy, file_write_dir_params) =
+        if file_system_sandbox_policy.has_full_disk_write_access() {
+            if unreadable_roots.is_empty() {
+                // Allegedly, this is more permissive than `(allow file-write*)`.
+                (
+                    r#"(allow file-write* (regex #"^/"))"#.to_string(),
+                    Vec::new(),
+                )
+            } else {
+                build_seatbelt_access_policy(
+                    "file-write*",
+                    "WRITABLE_ROOT",
+                    vec![SeatbeltAccessRoot {
+                        root: root_absolute_path(),
+                        excluded_subpaths: unreadable_roots.clone(),
+                    }],
+                )
+            }
+        } else {
+            build_seatbelt_access_policy(
+                "file-write*",
+                "WRITABLE_ROOT",
+                file_system_sandbox_policy
+                    .get_writable_roots_with_cwd(sandbox_policy_cwd)
+                    .into_iter()
+                    .map(|root| SeatbeltAccessRoot {
+                        root: root.root,
+                        excluded_subpaths: root.read_only_subpaths,
+                    })
+                    .collect(),
+            )
+        };
+
+    let (file_read_policy, file_read_dir_params) =
+        if file_system_sandbox_policy.has_full_disk_read_access() {
+            if unreadable_roots.is_empty() {
+                (
+                    "; allow read-only file operations\n(allow file-read*)".to_string(),
+                    Vec::new(),
+                )
+            } else {
+                let (policy, params) = build_seatbelt_access_policy(
+                    "file-read*",
+                    "READABLE_ROOT",
+                    vec![SeatbeltAccessRoot {
+                        root: root_absolute_path(),
+                        excluded_subpaths: unreadable_roots,
+                    }],
+                );
+                (
+                    format!("; allow read-only file operations\n{policy}"),
+                    params,
+                )
+            }
+        } else {
+            let (policy, params) = build_seatbelt_access_policy(
+                "file-read*",
+                "READABLE_ROOT",
+                file_system_sandbox_policy
+                    .get_readable_roots_with_cwd(sandbox_policy_cwd)
+                    .into_iter()
+                    .map(|root| SeatbeltAccessRoot {
+                        excluded_subpaths: unreadable_roots
+                            .iter()
+                            .filter(|path| path.as_path().starts_with(root.as_path()))
+                            .cloned()
+                            .collect(),
+                        root,
+                    })
+                    .collect(),
+            );
+            if policy.is_empty() {
+                (String::new(), params)
+            } else {
+                (
+                    format!("; allow read-only file operations\n{policy}"),
+                    params,
+                )
+            }
+        };
+
+    let proxy = proxy_policy_inputs(network);
+    let network_policy =
+        dynamic_network_policy_for_network(network_sandbox_policy, enforce_managed_network, &proxy);
+    let seatbelt_extensions = extensions.map_or_else(
+        || {
+            // Backward-compatibility default when no extension profile is provided.
+            build_seatbelt_extensions(&MacOsSeatbeltProfileExtensions::default())
+        },
+        build_seatbelt_extensions,
     );
 
-    let dir_params = [file_write_dir_params, macos_dir_params()].concat();
+    let include_platform_defaults = file_system_sandbox_policy.include_platform_defaults();
+    let mut policy_sections = vec![
+        MACOS_SEATBELT_BASE_POLICY.to_string(),
+        file_read_policy,
+        file_write_policy,
+        network_policy,
+    ];
+    if include_platform_defaults {
+        policy_sections.push(MACOS_RESTRICTED_READ_ONLY_PLATFORM_DEFAULTS.to_string());
+    }
+    if !seatbelt_extensions.policy.is_empty() {
+        policy_sections.push(seatbelt_extensions.policy.clone());
+    }
+
+    let full_policy = policy_sections.join("\n");
+
+    let dir_params = [
+        file_read_dir_params,
+        file_write_dir_params,
+        macos_dir_params(),
+        unix_socket_dir_params(&proxy),
+        seatbelt_extensions.dir_params,
+    ]
+    .concat();
 
     let mut seatbelt_args: Vec<String> = vec!["-p".to_string(), full_policy];
     let definition_args = dir_params
@@ -161,218 +590,5 @@ fn macos_dir_params() -> Vec<(String, PathBuf)> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::MACOS_SEATBELT_BASE_POLICY;
-    use super::create_seatbelt_command_args;
-    use super::macos_dir_params;
-    use crate::protocol::SandboxPolicy;
-    use pretty_assertions::assert_eq;
-    use std::fs;
-    use std::path::Path;
-    use std::path::PathBuf;
-    use tempfile::TempDir;
-
-    #[test]
-    fn create_seatbelt_args_with_read_only_git_subpath() {
-        // Create a temporary workspace with two writable roots: one containing
-        // a top-level .git directory and one without it.
-        let tmp = TempDir::new().expect("tempdir");
-        let PopulatedTmp {
-            root_with_git,
-            root_without_git,
-            root_with_git_canon,
-            root_with_git_git_canon,
-            root_without_git_canon,
-        } = populate_tmpdir(tmp.path());
-        let cwd = tmp.path().join("cwd");
-
-        // Build a policy that only includes the two test roots as writable and
-        // does not automatically include defaults TMPDIR or /tmp.
-        let policy = SandboxPolicy::WorkspaceWrite {
-            writable_roots: vec![root_with_git, root_without_git]
-                .into_iter()
-                .map(|p| p.try_into().unwrap())
-                .collect(),
-            network_access: false,
-            exclude_tmpdir_env_var: true,
-            exclude_slash_tmp: true,
-        };
-
-        let args = create_seatbelt_command_args(
-            vec!["/bin/echo".to_string(), "hello".to_string()],
-            &policy,
-            &cwd,
-        );
-
-        // Build the expected policy text using a raw string for readability.
-        // Note that the policy includes:
-        // - the base policy,
-        // - read-only access to the filesystem,
-        // - write access to WRITABLE_ROOT_0 (but not its .git) and WRITABLE_ROOT_1.
-        let expected_policy = format!(
-            r#"{MACOS_SEATBELT_BASE_POLICY}
-; allow read-only file operations
-(allow file-read*)
-(allow file-write*
-(require-all (subpath (param "WRITABLE_ROOT_0")) (require-not (subpath (param "WRITABLE_ROOT_0_RO_0"))) ) (subpath (param "WRITABLE_ROOT_1")) (subpath (param "WRITABLE_ROOT_2"))
-)
-"#,
-        );
-
-        let mut expected_args = vec![
-            "-p".to_string(),
-            expected_policy,
-            format!(
-                "-DWRITABLE_ROOT_0={}",
-                root_with_git_canon.to_string_lossy()
-            ),
-            format!(
-                "-DWRITABLE_ROOT_0_RO_0={}",
-                root_with_git_git_canon.to_string_lossy()
-            ),
-            format!(
-                "-DWRITABLE_ROOT_1={}",
-                root_without_git_canon.to_string_lossy()
-            ),
-            format!("-DWRITABLE_ROOT_2={}", cwd.to_string_lossy()),
-        ];
-
-        expected_args.extend(
-            macos_dir_params()
-                .into_iter()
-                .map(|(key, value)| format!("-D{key}={value}", value = value.to_string_lossy())),
-        );
-
-        expected_args.extend(vec![
-            "--".to_string(),
-            "/bin/echo".to_string(),
-            "hello".to_string(),
-        ]);
-
-        assert_eq!(expected_args, args);
-    }
-
-    #[test]
-    fn create_seatbelt_args_for_cwd_as_git_repo() {
-        // Create a temporary workspace with two writable roots: one containing
-        // a top-level .git directory and one without it.
-        let tmp = TempDir::new().expect("tempdir");
-        let PopulatedTmp {
-            root_with_git,
-            root_with_git_canon,
-            root_with_git_git_canon,
-            ..
-        } = populate_tmpdir(tmp.path());
-
-        // Build a policy that does not specify any writable_roots, but does
-        // use the default ones (cwd and TMPDIR) and verifies the `.git` check
-        // is done properly for cwd.
-        let policy = SandboxPolicy::WorkspaceWrite {
-            writable_roots: vec![],
-            network_access: false,
-            exclude_tmpdir_env_var: false,
-            exclude_slash_tmp: false,
-        };
-
-        let args = create_seatbelt_command_args(
-            vec!["/bin/echo".to_string(), "hello".to_string()],
-            &policy,
-            root_with_git.as_path(),
-        );
-
-        let tmpdir_env_var = std::env::var("TMPDIR")
-            .ok()
-            .map(PathBuf::from)
-            .and_then(|p| p.canonicalize().ok())
-            .map(|p| p.to_string_lossy().to_string());
-
-        let tempdir_policy_entry = if tmpdir_env_var.is_some() {
-            r#" (subpath (param "WRITABLE_ROOT_2"))"#
-        } else {
-            ""
-        };
-
-        // Build the expected policy text using a raw string for readability.
-        // Note that the policy includes:
-        // - the base policy,
-        // - read-only access to the filesystem,
-        // - write access to WRITABLE_ROOT_0 (but not its .git) and WRITABLE_ROOT_1.
-        let expected_policy = format!(
-            r#"{MACOS_SEATBELT_BASE_POLICY}
-; allow read-only file operations
-(allow file-read*)
-(allow file-write*
-(require-all (subpath (param "WRITABLE_ROOT_0")) (require-not (subpath (param "WRITABLE_ROOT_0_RO_0"))) ) (subpath (param "WRITABLE_ROOT_1")){tempdir_policy_entry}
-)
-"#,
-        );
-
-        let mut expected_args = vec![
-            "-p".to_string(),
-            expected_policy,
-            format!(
-                "-DWRITABLE_ROOT_0={}",
-                root_with_git_canon.to_string_lossy()
-            ),
-            format!(
-                "-DWRITABLE_ROOT_0_RO_0={}",
-                root_with_git_git_canon.to_string_lossy()
-            ),
-            format!(
-                "-DWRITABLE_ROOT_1={}",
-                PathBuf::from("/tmp")
-                    .canonicalize()
-                    .expect("canonicalize /tmp")
-                    .to_string_lossy()
-            ),
-        ];
-
-        if let Some(p) = tmpdir_env_var {
-            expected_args.push(format!("-DWRITABLE_ROOT_2={p}"));
-        }
-
-        expected_args.extend(
-            macos_dir_params()
-                .into_iter()
-                .map(|(key, value)| format!("-D{key}={value}", value = value.to_string_lossy())),
-        );
-
-        expected_args.extend(vec![
-            "--".to_string(),
-            "/bin/echo".to_string(),
-            "hello".to_string(),
-        ]);
-
-        assert_eq!(expected_args, args);
-    }
-
-    struct PopulatedTmp {
-        root_with_git: PathBuf,
-        root_without_git: PathBuf,
-        root_with_git_canon: PathBuf,
-        root_with_git_git_canon: PathBuf,
-        root_without_git_canon: PathBuf,
-    }
-
-    fn populate_tmpdir(tmp: &Path) -> PopulatedTmp {
-        let root_with_git = tmp.join("with_git");
-        let root_without_git = tmp.join("no_git");
-        fs::create_dir_all(&root_with_git).expect("create with_git");
-        fs::create_dir_all(&root_without_git).expect("create no_git");
-        fs::create_dir_all(root_with_git.join(".git")).expect("create .git");
-
-        // Ensure we have canonical paths for -D parameter matching.
-        let root_with_git_canon = root_with_git.canonicalize().expect("canonicalize with_git");
-        let root_with_git_git_canon = root_with_git_canon.join(".git");
-        let root_without_git_canon = root_without_git
-            .canonicalize()
-            .expect("canonicalize no_git");
-        PopulatedTmp {
-            root_with_git,
-            root_without_git,
-            root_with_git_canon,
-            root_with_git_git_canon,
-            root_without_git_canon,
-        }
-    }
-}
+#[path = "seatbelt_tests.rs"]
+mod tests;
