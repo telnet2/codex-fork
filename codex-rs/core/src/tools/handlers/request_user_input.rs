@@ -2,68 +2,51 @@ use crate::function_tool::FunctionCallError;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
+use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::parse_arguments;
-use crate::tools::registry::ToolHandler;
-use crate::tools::registry::ToolKind;
-use async_trait::async_trait;
+use crate::tools::handlers::request_user_input_spec::REQUEST_USER_INPUT_TOOL_NAME;
+use crate::tools::handlers::request_user_input_spec::RequestUserInputToolArgs;
+use crate::tools::handlers::request_user_input_spec::create_request_user_input_tool;
+use crate::tools::handlers::request_user_input_spec::normalize_request_user_input_tool_args;
+use crate::tools::handlers::request_user_input_spec::request_user_input_tool_description;
+use crate::tools::handlers::request_user_input_spec::request_user_input_unavailable_message;
+use crate::tools::registry::CoreToolRuntime;
+use crate::tools::registry::ToolExecutor;
+use codex_features::Feature;
+use codex_history::RetainedContextEvent;
+use codex_history::VerifiedAnswer;
+use codex_history::VerifiedQuestionAnswer;
 use codex_protocol::config_types::ModeKind;
-use codex_protocol::config_types::TUI_VISIBLE_COLLABORATION_MODES;
 use codex_protocol::request_user_input::RequestUserInputArgs;
-
-fn request_user_input_is_available(mode: ModeKind, default_mode_request_user_input: bool) -> bool {
-    mode.allows_request_user_input()
-        || (default_mode_request_user_input && mode == ModeKind::Default)
-}
-
-fn format_allowed_modes(default_mode_request_user_input: bool) -> String {
-    let mode_names: Vec<&str> = TUI_VISIBLE_COLLABORATION_MODES
-        .into_iter()
-        .filter(|mode| request_user_input_is_available(*mode, default_mode_request_user_input))
-        .map(ModeKind::display_name)
-        .collect();
-
-    match mode_names.as_slice() {
-        [] => "no modes".to_string(),
-        [mode] => format!("{mode} mode"),
-        [first, second] => format!("{first} or {second} mode"),
-        [..] => format!("modes: {}", mode_names.join(",")),
-    }
-}
-
-pub(crate) fn request_user_input_unavailable_message(
-    mode: ModeKind,
-    default_mode_request_user_input: bool,
-) -> Option<String> {
-    if request_user_input_is_available(mode, default_mode_request_user_input) {
-        None
-    } else {
-        let mode_name = mode.display_name();
-        Some(format!(
-            "request_user_input is unavailable in {mode_name} mode"
-        ))
-    }
-}
-
-pub(crate) fn request_user_input_tool_description(default_mode_request_user_input: bool) -> String {
-    let allowed_modes = format_allowed_modes(default_mode_request_user_input);
-    format!(
-        "Request user input for one to three short questions and wait for the response. This tool is only available in {allowed_modes}."
-    )
-}
+use codex_tools::ToolName;
+use codex_tools::ToolSpec;
 
 pub struct RequestUserInputHandler {
-    pub default_mode_request_user_input: bool,
+    pub available_modes: Vec<ModeKind>,
 }
 
-#[async_trait]
-impl ToolHandler for RequestUserInputHandler {
-    type Output = FunctionToolOutput;
-
-    fn kind(&self) -> ToolKind {
-        ToolKind::Function
+impl ToolExecutor<ToolInvocation> for RequestUserInputHandler {
+    fn tool_name(&self) -> ToolName {
+        ToolName::plain(REQUEST_USER_INPUT_TOOL_NAME)
     }
 
-    async fn handle(&self, invocation: ToolInvocation) -> Result<Self::Output, FunctionCallError> {
+    fn spec(&self) -> ToolSpec {
+        create_request_user_input_tool(request_user_input_tool_description(&self.available_modes))
+    }
+
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
+        Box::pin(self.handle_call(invocation))
+    }
+}
+
+impl RequestUserInputHandler {
+    async fn handle_call(
+        &self,
+        invocation: ToolInvocation,
+    ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
         let ToolInvocation {
             session,
             turn,
@@ -75,48 +58,103 @@ impl ToolHandler for RequestUserInputHandler {
         let arguments = match payload {
             ToolPayload::Function { arguments } => arguments,
             _ => {
-                return Err(FunctionCallError::RespondToModel(
-                    "request_user_input handler received unsupported payload".to_string(),
-                ));
+                return Err(FunctionCallError::RespondToModel(format!(
+                    "{REQUEST_USER_INPUT_TOOL_NAME} handler received unsupported payload"
+                )));
             }
         };
 
-        let mode = session.collaboration_mode().await.mode;
-        if let Some(message) =
-            request_user_input_unavailable_message(mode, self.default_mode_request_user_input)
-        {
+        if turn.session_source.is_non_root_agent() {
+            return Err(FunctionCallError::RespondToModel(
+                "request_user_input can only be used by the root thread".to_string(),
+            ));
+        }
+
+        let mode = turn.collaboration_mode().mode;
+        if let Some(message) = request_user_input_unavailable_message(mode, &self.available_modes) {
             return Err(FunctionCallError::RespondToModel(message));
         }
 
-        let mut args: RequestUserInputArgs = parse_arguments(&arguments)?;
-        let missing_options = args
-            .questions
-            .iter()
-            .any(|question| question.options.as_ref().is_none_or(Vec::is_empty));
-        if missing_options {
-            return Err(FunctionCallError::RespondToModel(
-                "request_user_input requires non-empty options for every question".to_string(),
-            ));
-        }
-        for question in &mut args.questions {
-            question.is_other = true;
-        }
-        let response = session
-            .request_user_input(turn.as_ref(), call_id, args)
+        let args: RequestUserInputToolArgs = parse_arguments(&arguments)?;
+        let args = normalize_request_user_input_tool_args(args)
+            .map_err(FunctionCallError::RespondToModel)?;
+        let args = RequestUserInputArgs {
+            questions: args.questions,
+            is_blocking: mode == ModeKind::Plan,
+            auto_resolution_ms: None,
+        };
+        let questions = args.questions.clone();
+        let accepted = session
+            .request_user_input(turn.as_ref(), call_id.clone(), args)
             .await
             .ok_or_else(|| {
-                FunctionCallError::RespondToModel(
-                    "request_user_input was cancelled before receiving a response".to_string(),
-                )
+                FunctionCallError::RespondToModel(format!(
+                    "{REQUEST_USER_INPUT_TOOL_NAME} was cancelled before receiving a response"
+                ))
             })?;
+
+        let response = accepted.response;
 
         let content = serde_json::to_string(&response).map_err(|err| {
             FunctionCallError::Fatal(format!(
-                "failed to serialize request_user_input response: {err}"
+                "failed to serialize {REQUEST_USER_INPUT_TOOL_NAME} response: {err}"
             ))
         })?;
+        // Persist answers even while an older checkpoint needs compatibility review.
+        if turn.config.features.enabled(Feature::GuardianApproval) {
+            let user_input = questions
+                .iter()
+                .filter_map(|question| {
+                    let response = response.answers.get(&question.id)?;
+                    let answers = response
+                        .answers
+                        .iter()
+                        .filter(|answer| !answer.trim().is_empty())
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if answers.is_empty() {
+                        return None;
+                    }
+                    let mut question_text = question.question.clone();
+                    for option in question
+                        .options
+                        .iter()
+                        .flatten()
+                        .filter(|option| response.answers.contains(&option.label))
+                    {
+                        question_text
+                            .push_str(&format!("\n{}: {}", option.label, option.description));
+                    }
+                    Some(VerifiedQuestionAnswer {
+                        question: question_text,
+                        answer: answers.join("\n"),
+                    })
+                })
+                .collect::<Vec<_>>();
+            if !user_input.is_empty() {
+                session
+                    .record_retained_context(RetainedContextEvent::VerifiedAnswer {
+                        answer: VerifiedAnswer {
+                            turn_id: turn.sub_id.clone(),
+                            call_id,
+                            questions: user_input,
+                        },
+                        acceptance_order: Some(accepted.acceptance_order),
+                    })
+                    .await;
+            }
+        }
 
-        Ok(FunctionToolOutput::from_text(content, Some(true)))
+        Ok(boxed_tool_output(FunctionToolOutput::from_text(
+            content,
+            /*success*/ Some(true),
+        )))
+    }
+}
+
+impl CoreToolRuntime for RequestUserInputHandler {
+    fn is_builtin_control_tool(&self) -> bool {
+        true
     }
 }
 

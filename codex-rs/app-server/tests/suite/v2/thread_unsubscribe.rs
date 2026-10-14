@@ -1,16 +1,17 @@
-use anyhow::Context;
 use anyhow::Result;
-use app_test_support::McpProcess;
-use app_test_support::create_final_assistant_message_sse_response;
+use app_test_support::MockResponsesConfig;
+use app_test_support::TestAppServer;
 use app_test_support::create_mock_responses_server_repeating_assistant;
-use app_test_support::create_mock_responses_server_sequence_unchecked;
-use app_test_support::create_shell_command_sse_response;
-use app_test_support::to_response;
+use app_test_support::write_models_cache;
+use codex_app_server_protocol::ClientRequest;
+use codex_app_server_protocol::DynamicToolCallOutputContentItem;
+use codex_app_server_protocol::DynamicToolCallParams;
+use codex_app_server_protocol::DynamicToolCallResponse;
+use codex_app_server_protocol::DynamicToolFunctionSpec;
+use codex_app_server_protocol::DynamicToolSpec;
 use codex_app_server_protocol::ItemStartedNotification;
-use codex_app_server_protocol::JSONRPCNotification;
-use codex_app_server_protocol::JSONRPCResponse;
-use codex_app_server_protocol::RequestId;
-use codex_app_server_protocol::ServerNotification;
+use codex_app_server_protocol::ServerRequest;
+use codex_app_server_protocol::ThreadClosedNotification;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadLoadedListParams;
 use codex_app_server_protocol::ThreadLoadedListResponse;
@@ -28,207 +29,348 @@ use codex_app_server_protocol::ThreadUnsubscribeStatus;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::UserInput as V2UserInput;
+use codex_features::Feature;
 use core_test_support::responses;
+use core_test_support::streaming_sse::StreamingSseChunk;
+use core_test_support::streaming_sse::start_streaming_sse_server;
 use pretty_assertions::assert_eq;
+use serde_json::json;
 use tempfile::TempDir;
+use test_case::test_case;
 use tokio::time::timeout;
 
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+#[tokio::test]
+async fn thread_unsubscribe_keeps_thread_loaded_until_idle_timeout() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri())
+        .with_sandbox_mode("danger-full-access")
+        .with_root_config("thread_unload_delay_secs = 2")
+        .write(codex_home.path())?;
 
-async fn wait_for_responses_request_count_to_stabilize(
-    server: &wiremock::MockServer,
-    expected_count: usize,
-    settle_duration: std::time::Duration,
-) -> Result<()> {
-    timeout(DEFAULT_READ_TIMEOUT, async {
-        let mut stable_since: Option<tokio::time::Instant> = None;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+
+    let ThreadStartResponse { thread, .. } = mcp
+        .start_thread(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let thread_id = thread.id;
+
+    // Persist a rollout so both warm and cold resumes can find the thread.
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.start_turn_and_wait_for_completion(TurnStartParams {
+            thread_id: thread_id.clone(),
+            input: vec![V2UserInput::Text {
+                text: "hello".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        }),
+    )
+    .await??;
+
+    let unsubscribe: ThreadUnsubscribeResponse = mcp
+        .request(|request_id| ClientRequest::ThreadUnsubscribe {
+            request_id,
+            params: ThreadUnsubscribeParams {
+                thread_id: thread_id.clone(),
+            },
+        })
+        .await?;
+    assert_eq!(unsubscribe.status, ThreadUnsubscribeStatus::Unsubscribed);
+
+    assert!(
+        timeout(
+            std::time::Duration::from_millis(250),
+            mcp.read_stream_until_notification_message("thread/closed"),
+        )
+        .await
+        .is_err()
+    );
+
+    let ThreadLoadedListResponse { data, next_cursor } = mcp
+        .request(|request_id| ClientRequest::ThreadLoadedList {
+            request_id,
+            params: ThreadLoadedListParams::default(),
+        })
+        .await?;
+    assert_eq!(data, vec![thread_id.clone()]);
+    assert_eq!(next_cursor, None);
+
+    let resume: ThreadResumeResponse = mcp
+        .request(|request_id| ClientRequest::ThreadResume {
+            request_id,
+            params: ThreadResumeParams {
+                thread_id: thread_id.clone(),
+                ..Default::default()
+            },
+        })
+        .await?;
+    assert_eq!(resume.thread.id, thread_id);
+
+    // Resubscribing cancels the pending unload, even after the original deadline.
+    assert!(
+        timeout(
+            std::time::Duration::from_millis(2200),
+            mcp.read_stream_until_notification_message("thread/closed"),
+        )
+        .await
+        .is_err()
+    );
+    let _: ThreadUnsubscribeResponse = mcp
+        .request(|request_id| ClientRequest::ThreadUnsubscribe {
+            request_id,
+            params: ThreadUnsubscribeParams {
+                thread_id: thread_id.clone(),
+            },
+        })
+        .await?;
+    // Losing the last subscriber starts a fresh countdown.
+    assert!(
+        timeout(
+            std::time::Duration::from_millis(250),
+            mcp.read_stream_until_notification_message("thread/closed"),
+        )
+        .await
+        .is_err()
+    );
+
+    let closed: ThreadClosedNotification =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_notification("thread/closed")).await??;
+    assert_eq!(
+        closed,
+        ThreadClosedNotification {
+            thread_id: thread_id.clone()
+        }
+    );
+    let status = timeout(DEFAULT_READ_TIMEOUT, async {
         loop {
-            let requests = server
-                .received_requests()
-                .await
-                .context("failed to fetch received requests")?;
-            let responses_request_count = requests
-                .iter()
-                .filter(|request| {
-                    request.method == "POST" && request.url.path().ends_with("/responses")
-                })
-                .count();
-
-            if responses_request_count > expected_count {
-                anyhow::bail!(
-                    "expected exactly {expected_count} /responses requests, got {responses_request_count}"
-                );
+            let status: ThreadStatusChangedNotification =
+                mcp.read_notification("thread/status/changed").await?;
+            if status.status == ThreadStatus::NotLoaded {
+                return anyhow::Ok(status);
             }
-
-            if responses_request_count == expected_count {
-                match stable_since {
-                    Some(stable_since) if stable_since.elapsed() >= settle_duration => {
-                        return Ok::<(), anyhow::Error>(());
-                    }
-                    None => stable_since = Some(tokio::time::Instant::now()),
-                    Some(_) => {}
-                }
-            } else {
-                stable_since = None;
-            }
-
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     })
     .await??;
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn thread_unsubscribe_unloads_thread_and_emits_thread_closed_notification() -> Result<()> {
-    let server = create_mock_responses_server_repeating_assistant("Done").await;
-    let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
-
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-
-    let thread_id = start_thread(&mut mcp).await?;
-
-    let unsubscribe_id = mcp
-        .send_thread_unsubscribe_request(ThreadUnsubscribeParams {
+    assert_eq!(
+        status,
+        ThreadStatusChangedNotification {
             thread_id: thread_id.clone(),
+            status: ThreadStatus::NotLoaded,
+        }
+    );
+    let loaded: ThreadLoadedListResponse = mcp
+        .request(|request_id| ClientRequest::ThreadLoadedList {
+            request_id,
+            params: ThreadLoadedListParams::default(),
         })
         .await?;
-    let unsubscribe_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(unsubscribe_id)),
-    )
-    .await??;
-    let unsubscribe = to_response::<ThreadUnsubscribeResponse>(unsubscribe_resp)?;
-    assert_eq!(unsubscribe.status, ThreadUnsubscribeStatus::Unsubscribed);
+    assert_eq!(
+        loaded,
+        ThreadLoadedListResponse {
+            data: Vec::new(),
+            next_cursor: None
+        }
+    );
 
-    let closed_notif: JSONRPCNotification = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("thread/closed"),
-    )
-    .await??;
-    let parsed: ServerNotification = closed_notif.try_into()?;
-    let ServerNotification::ThreadClosed(payload) = parsed else {
-        anyhow::bail!("expected thread/closed notification");
-    };
-    assert_eq!(payload.thread_id, thread_id);
-
-    let status_changed = wait_for_thread_status_not_loaded(&mut mcp, &payload.thread_id).await?;
-    assert_eq!(status_changed.thread_id, payload.thread_id);
-    assert_eq!(status_changed.status, ThreadStatus::NotLoaded);
-
-    let list_id = mcp
-        .send_thread_loaded_list_request(ThreadLoadedListParams::default())
+    let resume: ThreadResumeResponse = mcp
+        .request(|request_id| ClientRequest::ThreadResume {
+            request_id,
+            params: ThreadResumeParams {
+                thread_id: thread_id.clone(),
+                ..Default::default()
+            },
+        })
         .await?;
-    let list_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(list_id)),
-    )
-    .await??;
-    let ThreadLoadedListResponse { data, next_cursor } =
-        to_response::<ThreadLoadedListResponse>(list_resp)?;
-    assert_eq!(data, Vec::<String>::new());
-    assert_eq!(next_cursor, None);
+    assert_eq!(resume.thread.id, thread_id);
+    assert_eq!(resume.thread.status, ThreadStatus::Idle);
 
     Ok(())
 }
 
+#[test_case(0; "zero_delay")]
+#[test_case(1; "one_second_delay")]
 #[tokio::test]
-async fn thread_unsubscribe_during_turn_interrupts_turn_and_emits_thread_closed() -> Result<()> {
-    #[cfg(target_os = "windows")]
-    let shell_command = vec![
-        "powershell".to_string(),
-        "-Command".to_string(),
-        "Start-Sleep -Seconds 10".to_string(),
-    ];
-    #[cfg(not(target_os = "windows"))]
-    let shell_command = vec!["sleep".to_string(), "10".to_string()];
+async fn thread_unsubscribe_during_turn_keeps_turn_running(delay_secs: u64) -> Result<()> {
+    let call_id = "deterministic-wait-call";
+    let tool_name = "deterministic_wait";
+    let tool_args = json!({});
+    let tool_call_arguments = serde_json::to_string(&tool_args)?;
 
     let tmp = TempDir::new()?;
     let codex_home = tmp.path().join("codex_home");
     std::fs::create_dir(&codex_home)?;
-    let working_directory = tmp.path().join("workdir");
-    std::fs::create_dir(&working_directory)?;
 
-    let server = create_mock_responses_server_sequence_unchecked(vec![
-        create_shell_command_sse_response(
-            shell_command.clone(),
-            Some(&working_directory),
-            Some(10_000),
-            "call_sleep",
-        )?,
-        create_final_assistant_message_sse_response("Done")?,
+    let (server, mut completions) = start_streaming_sse_server(vec![
+        vec![StreamingSseChunk {
+            gate: None,
+            body: responses::sse(vec![
+                responses::ev_response_created("resp-1"),
+                responses::ev_function_call(call_id, tool_name, &tool_call_arguments),
+                responses::ev_completed("resp-1"),
+            ]),
+        }],
+        vec![StreamingSseChunk {
+            gate: None,
+            body: responses::sse(vec![
+                responses::ev_response_created("resp-2"),
+                responses::ev_assistant_message("msg-1", "Done"),
+                responses::ev_completed("resp-2"),
+            ]),
+        }],
     ])
     .await;
-    create_config_toml(&codex_home, &server.uri())?;
+    let first_response_completed = completions.remove(0);
+    let final_response_completed = completions.remove(0);
+    MockResponsesConfig::new(server.uri())
+        .with_sandbox_mode("danger-full-access")
+        .with_root_config(&format!("thread_unload_delay_secs = {delay_secs}"))
+        .write(&codex_home)?;
 
-    let mut mcp = McpProcess::new(&codex_home).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(&codex_home)
+        .build_initialized()
+        .await?;
 
-    let thread_id = start_thread(&mut mcp).await?;
-
-    let turn_req = mcp
-        .send_turn_start_request(TurnStartParams {
-            thread_id: thread_id.clone(),
-            input: vec![V2UserInput::Text {
-                text: "run sleep".to_string(),
-                text_elements: Vec::new(),
-            }],
-            cwd: Some(working_directory),
+    let ThreadStartResponse { thread, .. } = mcp
+        .start_thread(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            dynamic_tools: Some(vec![DynamicToolSpec::Function(DynamicToolFunctionSpec {
+                name: tool_name.to_string(),
+                description: "Deterministic wait tool".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false,
+                }),
+                defer_loading: false,
+            })]),
             ..Default::default()
         })
         .await?;
-    let turn_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
-    )
-    .await??;
-    let _: TurnStartResponse = to_response::<TurnStartResponse>(turn_resp)?;
+    let thread_id = thread.id;
+
+    // A subscribed, idle thread stays loaded even with no unload delay.
+    assert!(
+        timeout(
+            std::time::Duration::from_millis(250),
+            mcp.read_stream_until_notification_message("thread/closed"),
+        )
+        .await
+        .is_err()
+    );
+
+    let _: TurnStartResponse = mcp
+        .request(|request_id| ClientRequest::TurnStart {
+            request_id,
+            params: TurnStartParams {
+                thread_id: thread_id.clone(),
+                client_user_message_id: None,
+                input: vec![V2UserInput::Text {
+                    text: "run deterministic tool".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                ..Default::default()
+            },
+        })
+        .await?;
 
     timeout(
         DEFAULT_READ_TIMEOUT,
-        wait_for_command_execution_item_started(&mut mcp),
-    )
-    .await??;
-
-    let unsubscribe_id = mcp
-        .send_thread_unsubscribe_request(ThreadUnsubscribeParams {
-            thread_id: thread_id.clone(),
-        })
-        .await?;
-    let unsubscribe_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(unsubscribe_id)),
-    )
-    .await??;
-    let unsubscribe = to_response::<ThreadUnsubscribeResponse>(unsubscribe_resp)?;
-    assert_eq!(unsubscribe.status, ThreadUnsubscribeStatus::Unsubscribed);
-
-    let closed_notif: JSONRPCNotification = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("thread/closed"),
-    )
-    .await??;
-    let parsed: ServerNotification = closed_notif.try_into()?;
-    let ServerNotification::ThreadClosed(payload) = parsed else {
-        anyhow::bail!("expected thread/closed notification");
-    };
-    assert_eq!(payload.thread_id, thread_id);
-
-    wait_for_responses_request_count_to_stabilize(
-        &server,
-        1,
-        std::time::Duration::from_millis(200),
+        server.wait_for_request_count(/*count*/ 1),
     )
     .await?;
+    timeout(DEFAULT_READ_TIMEOUT, first_response_completed).await??;
+
+    let started = timeout(
+        DEFAULT_READ_TIMEOUT,
+        wait_for_dynamic_tool_started(&mut mcp, call_id),
+    )
+    .await??;
+    assert_eq!(started.thread_id, thread_id);
+
+    let request = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_request_message(),
+    )
+    .await??;
+    let (request_id, params) = match request {
+        ServerRequest::DynamicToolCall { request_id, params } => (request_id, params),
+        other => panic!("expected DynamicToolCall request, got {other:?}"),
+    };
+    assert_eq!(
+        params,
+        DynamicToolCallParams {
+            thread_id: thread_id.clone(),
+            turn_id: started.turn_id,
+            call_id: call_id.to_string(),
+            namespace: None,
+            tool: tool_name.to_string(),
+            arguments: tool_args,
+        }
+    );
+
+    let unsubscribe: ThreadUnsubscribeResponse = mcp
+        .request(|request_id| ClientRequest::ThreadUnsubscribe {
+            request_id,
+            params: ThreadUnsubscribeParams {
+                thread_id: thread_id.clone(),
+            },
+        })
+        .await?;
+    assert_eq!(unsubscribe.status, ThreadUnsubscribeStatus::Unsubscribed);
+
+    let closed_while_tool_call_blocked = timeout(
+        std::time::Duration::from_millis(1200),
+        mcp.read_stream_until_notification_message("thread/closed"),
+    );
+    let closed_while_tool_call_blocked = closed_while_tool_call_blocked.await;
+    assert!(closed_while_tool_call_blocked.is_err());
+
+    let response = DynamicToolCallResponse {
+        content_items: vec![DynamicToolCallOutputContentItem::InputText {
+            text: "dynamic-ok".to_string(),
+        }],
+        success: true,
+    };
+    mcp.send_response(request_id, serde_json::to_value(response)?)
+        .await?;
+
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        server.wait_for_request_count(/*count*/ 2),
+    )
+    .await?;
+    timeout(DEFAULT_READ_TIMEOUT, final_response_completed).await??;
+    if delay_secs > 0 {
+        // Once the turn finishes, inactivity starts a fresh countdown.
+        assert!(
+            timeout(
+                std::time::Duration::from_millis(250),
+                mcp.read_stream_until_notification_message("thread/closed"),
+            )
+            .await
+            .is_err()
+        );
+    }
+    let closed: ThreadClosedNotification =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_notification("thread/closed")).await??;
+    assert_eq!(closed, ThreadClosedNotification { thread_id });
+    server.shutdown().await;
 
     Ok(())
 }
 
 #[tokio::test]
-async fn thread_unsubscribe_clears_cached_status_before_resume() -> Result<()> {
+async fn thread_unsubscribe_preserves_cached_status_before_idle_unload() -> Result<()> {
     let server = responses::start_mock_server().await;
     let _response_mock = responses::mount_sse_once(
         &server,
@@ -236,204 +378,334 @@ async fn thread_unsubscribe_clears_cached_status_before_resume() -> Result<()> {
     )
     .await;
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    MockResponsesConfig::new(&server.uri())
+        .with_sandbox_mode("danger-full-access")
+        .write(codex_home.path())?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
 
-    let thread_id = start_thread(&mut mcp).await?;
-
-    let turn_req = mcp
-        .send_turn_start_request(TurnStartParams {
-            thread_id: thread_id.clone(),
-            input: vec![V2UserInput::Text {
-                text: "fail this turn".to_string(),
-                text_elements: Vec::new(),
-            }],
+    let ThreadStartResponse { thread, .. } = mcp
+        .start_thread(ThreadStartParams {
+            model: Some("mock-model".to_string()),
             ..Default::default()
         })
         .await?;
-    let turn_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
-    )
-    .await??;
-    let _: TurnStartResponse = to_response::<TurnStartResponse>(turn_resp)?;
+    let thread_id = thread.id;
+
+    let _: TurnStartResponse = mcp
+        .request(|request_id| ClientRequest::TurnStart {
+            request_id,
+            params: TurnStartParams {
+                thread_id: thread_id.clone(),
+                client_user_message_id: None,
+                input: vec![V2UserInput::Text {
+                    text: "fail this turn".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                ..Default::default()
+            },
+        })
+        .await?;
     timeout(
         DEFAULT_READ_TIMEOUT,
         mcp.read_stream_until_notification_message("error"),
     )
     .await??;
 
-    let read_id = mcp
-        .send_thread_read_request(ThreadReadParams {
-            thread_id: thread_id.clone(),
-            include_turns: false,
+    let ThreadReadResponse { thread, .. } = mcp
+        .request(|request_id| ClientRequest::ThreadRead {
+            request_id,
+            params: ThreadReadParams {
+                thread_id: thread_id.clone(),
+                include_turns: false,
+            },
         })
         .await?;
-    let read_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
-    )
-    .await??;
-    let ThreadReadResponse { thread } = to_response::<ThreadReadResponse>(read_resp)?;
     assert_eq!(thread.status, ThreadStatus::SystemError);
 
-    let unsubscribe_id = mcp
-        .send_thread_unsubscribe_request(ThreadUnsubscribeParams {
-            thread_id: thread_id.clone(),
+    let unsubscribe: ThreadUnsubscribeResponse = mcp
+        .request(|request_id| ClientRequest::ThreadUnsubscribe {
+            request_id,
+            params: ThreadUnsubscribeParams {
+                thread_id: thread_id.clone(),
+            },
         })
         .await?;
-    let unsubscribe_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(unsubscribe_id)),
-    )
-    .await??;
-    let unsubscribe = to_response::<ThreadUnsubscribeResponse>(unsubscribe_resp)?;
     assert_eq!(unsubscribe.status, ThreadUnsubscribeStatus::Unsubscribed);
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("thread/closed"),
-    )
-    .await??;
+    assert!(
+        timeout(
+            std::time::Duration::from_millis(250),
+            mcp.read_stream_until_notification_message("thread/closed"),
+        )
+        .await
+        .is_err()
+    );
 
-    let resume_id = mcp
-        .send_thread_resume_request(ThreadResumeParams {
-            thread_id,
-            ..Default::default()
+    let resume: ThreadResumeResponse = mcp
+        .request(|request_id| ClientRequest::ThreadResume {
+            request_id,
+            params: ThreadResumeParams {
+                thread_id,
+                cwd: Some(codex_home.path().to_string_lossy().to_string()),
+                ..Default::default()
+            },
         })
         .await?;
-    let resume_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(resume_id)),
-    )
-    .await??;
-    let resume: ThreadResumeResponse = to_response::<ThreadResumeResponse>(resume_resp)?;
-    assert_eq!(resume.thread.status, ThreadStatus::Idle);
+    assert_eq!(resume.thread.status, ThreadStatus::SystemError);
 
     Ok(())
 }
 
 #[tokio::test]
-async fn thread_unsubscribe_reports_not_loaded_after_thread_is_unloaded() -> Result<()> {
+async fn thread_unsubscribe_reports_not_subscribed_before_idle_unload() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    MockResponsesConfig::new(&server.uri())
+        .with_sandbox_mode("danger-full-access")
+        .write(codex_home.path())?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
 
-    let thread_id = start_thread(&mut mcp).await?;
-
-    let first_unsubscribe_id = mcp
-        .send_thread_unsubscribe_request(ThreadUnsubscribeParams {
-            thread_id: thread_id.clone(),
+    let ThreadStartResponse { thread, .. } = mcp
+        .start_thread(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            ..Default::default()
         })
         .await?;
-    let first_unsubscribe_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(first_unsubscribe_id)),
-    )
-    .await??;
-    let first_unsubscribe = to_response::<ThreadUnsubscribeResponse>(first_unsubscribe_resp)?;
+    let thread_id = thread.id;
+
+    let first_unsubscribe: ThreadUnsubscribeResponse = mcp
+        .request(|request_id| ClientRequest::ThreadUnsubscribe {
+            request_id,
+            params: ThreadUnsubscribeParams {
+                thread_id: thread_id.clone(),
+            },
+        })
+        .await?;
     assert_eq!(
         first_unsubscribe.status,
         ThreadUnsubscribeStatus::Unsubscribed
     );
 
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("thread/closed"),
-    )
-    .await??;
-
-    let second_unsubscribe_id = mcp
-        .send_thread_unsubscribe_request(ThreadUnsubscribeParams { thread_id })
+    let second_unsubscribe: ThreadUnsubscribeResponse = mcp
+        .request(|request_id| ClientRequest::ThreadUnsubscribe {
+            request_id,
+            params: ThreadUnsubscribeParams { thread_id },
+        })
         .await?;
-    let second_unsubscribe_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(second_unsubscribe_id)),
-    )
-    .await??;
-    let second_unsubscribe = to_response::<ThreadUnsubscribeResponse>(second_unsubscribe_resp)?;
     assert_eq!(
         second_unsubscribe.status,
-        ThreadUnsubscribeStatus::NotLoaded
+        ThreadUnsubscribeStatus::NotSubscribed
     );
 
     Ok(())
 }
 
-async fn wait_for_command_execution_item_started(mcp: &mut McpProcess) -> Result<()> {
+async fn wait_for_dynamic_tool_started(
+    mcp: &mut TestAppServer,
+    call_id: &str,
+) -> Result<ItemStartedNotification> {
     loop {
-        let started_notif = mcp
+        let notification = mcp
             .read_stream_until_notification_message("item/started")
             .await?;
-        let started_params = started_notif.params.context("item/started params")?;
-        let started: ItemStartedNotification = serde_json::from_value(started_params)?;
-        if let ThreadItem::CommandExecution { .. } = started.item {
-            return Ok(());
+        let Some(params) = notification.params else {
+            continue;
+        };
+        let started: ItemStartedNotification = serde_json::from_value(params)?;
+        if matches!(&started.item, ThreadItem::DynamicToolCall { id, .. } if id == call_id) {
+            return Ok(started);
         }
     }
 }
 
-async fn wait_for_thread_status_not_loaded(
-    mcp: &mut McpProcess,
-    thread_id: &str,
-) -> Result<ThreadStatusChangedNotification> {
-    loop {
-        let status_changed_notif: JSONRPCNotification = timeout(
+#[tokio::test]
+async fn v2_child_idle_eviction_preserves_mail_and_followup_context() -> Result<()> {
+    let server = responses::start_mock_server().await;
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri())
+        .with_model("gpt-5.5")
+        .enable_feature(Feature::MultiAgentV2)
+        .with_root_config("thread_unload_delay_secs = 0")
+        .write(codex_home.path())?;
+    write_models_cache(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+    let parent = mcp.start_thread(ThreadStartParams::default()).await?.thread;
+    let mut child_id = None;
+
+    for (tool, args) in [
+        (
+            "spawn_agent",
+            json!({
+                "task_name": "worker", "fork_turns": "none", "message": "Initial child task"
+            }),
+        ),
+        (
+            "send_message",
+            json!({"target": "worker", "message": "Unread note for later"}),
+        ),
+        (
+            "followup_task",
+            json!({"target": "worker", "message": "Continue the child task"}),
+        ),
+    ] {
+        let call_id = format!("idle-eviction-{tool}");
+        let _call = responses::mount_sse_once_match(
+            &server,
+            wiremock::matchers::header("thread-id", parent.id.clone()),
+            responses::sse(vec![
+                responses::ev_function_call_with_namespace(
+                    &call_id,
+                    "collaboration",
+                    tool,
+                    &args.to_string(),
+                ),
+                responses::ev_completed("parent-call"),
+            ]),
+        )
+        .await;
+        let _parent_done = responses::mount_sse_once_match(
+            &server,
+            move |request: &wiremock::Request| {
+                String::from_utf8_lossy(&request.body).contains(&call_id)
+            },
+            responses::sse(vec![responses::ev_completed("parent-done")]),
+        )
+        .await;
+        if tool != "send_message" {
+            let parent_id = parent.id.clone();
+            let _child = responses::mount_sse_once_match(
+                &server,
+                move |request: &wiremock::Request| {
+                    request
+                        .headers
+                        .get("thread-id")
+                        .is_some_and(|id| id != parent_id.as_str())
+                },
+                responses::sse(vec![
+                    responses::ev_assistant_message(
+                        "child-result",
+                        "Remember the initial child result",
+                    ),
+                    responses::ev_completed("child-done"),
+                ]),
+            )
+            .await;
+        }
+        timeout(
             DEFAULT_READ_TIMEOUT,
-            mcp.read_stream_until_notification_message("thread/status/changed"),
+            mcp.start_turn_and_wait_for_completion(TurnStartParams {
+                thread_id: parent.id.clone(),
+                input: vec![V2UserInput::Text {
+                    text: format!("Run {tool}"),
+                    text_elements: Vec::new(),
+                }],
+                ..Default::default()
+            }),
         )
         .await??;
-        let status_changed_params = status_changed_notif
-            .params
-            .context("thread/status/changed params must be present")?;
-        let status_changed: ThreadStatusChangedNotification =
-            serde_json::from_value(status_changed_params)?;
-        if status_changed.thread_id == thread_id && status_changed.status == ThreadStatus::NotLoaded
-        {
-            return Ok(status_changed);
+
+        if tool != "send_message" {
+            let completed = timeout(
+                DEFAULT_READ_TIMEOUT,
+                mcp.read_stream_until_matching_notification(
+                    "child turn completed",
+                    |notification| {
+                        notification.method == "turn/completed"
+                            && notification
+                                .params
+                                .as_ref()
+                                .is_some_and(|params| params["threadId"] != parent.id)
+                    },
+                ),
+            )
+            .await??;
+            let params = completed.params.expect("child completion params");
+            let completed_child = params["threadId"].as_str().expect("child ID").to_string();
+            if let Some(child_id) = &child_id {
+                assert_eq!(&completed_child, child_id);
+            } else {
+                child_id = Some(completed_child);
+            }
+        } else {
+            // Mail is queued while subscribed. Unsubscribe lets the actual child listener
+            // evict it; the parent stays loaded so the follow-up uses the same agent tree.
+            let child_id = child_id.clone().expect("spawned child");
+            let unsubscribed: ThreadUnsubscribeResponse = mcp
+                .request(|request_id| ClientRequest::ThreadUnsubscribe {
+                    request_id,
+                    params: ThreadUnsubscribeParams {
+                        thread_id: child_id.clone(),
+                    },
+                })
+                .await?;
+            assert_eq!(unsubscribed.status, ThreadUnsubscribeStatus::Unsubscribed);
+            let closed: ThreadClosedNotification =
+                timeout(DEFAULT_READ_TIMEOUT, mcp.read_notification("thread/closed")).await??;
+            assert_eq!(
+                closed,
+                ThreadClosedNotification {
+                    thread_id: child_id.clone()
+                }
+            );
+            let loaded: ThreadLoadedListResponse = mcp
+                .request(|request_id| ClientRequest::ThreadLoadedList {
+                    request_id,
+                    params: ThreadLoadedListParams::default(),
+                })
+                .await?;
+            assert_eq!(loaded.data, vec![parent.id.clone()]);
+            assert_eq!(
+                responses::received_responses_requests(&server)
+                    .await
+                    .iter()
+                    .filter(
+                        |request| request.header("thread-id").as_deref() == Some(child_id.as_str())
+                    )
+                    .count(),
+                1,
+                "queue-only mail must not start another child turn",
+            );
         }
     }
-}
-
-fn create_config_toml(codex_home: &std::path::Path, server_uri: &str) -> std::io::Result<()> {
-    let config_toml = codex_home.join("config.toml");
-    std::fs::write(
-        config_toml,
-        format!(
-            r#"
-model = "mock-model"
-approval_policy = "never"
-sandbox_mode = "danger-full-access"
-
-model_provider = "mock_provider"
-
-[model_providers.mock_provider]
-name = "Mock provider for test"
-base_url = "{server_uri}/v1"
-wire_api = "responses"
-request_max_retries = 0
-stream_max_retries = 0
-"#
-        ),
-    )
-}
-
-async fn start_thread(mcp: &mut McpProcess) -> Result<String> {
-    let req_id = mcp
-        .send_thread_start_request(ThreadStartParams {
-            model: Some("mock-model".to_string()),
-            ..Default::default()
-        })
-        .await?;
-    let resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(req_id)),
-    )
-    .await??;
-    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(resp)?;
-    Ok(thread.id)
+    let child_id = child_id.expect("spawned child");
+    let requests = responses::received_responses_requests(&server).await;
+    let child_requests: Vec<_> = requests
+        .iter()
+        .filter(|request| request.header("thread-id").as_deref() == Some(child_id.as_str()))
+        .collect();
+    assert_eq!(child_requests.len(), 2);
+    assert_eq!(
+        child_requests[1]
+            .inputs_of_type("message")
+            .into_iter()
+            .filter(|item| item["role"] == "assistant")
+            .collect::<Vec<_>>(),
+        vec![json!({
+            "type": "message", "role": "assistant",
+            "content": [{"type": "output_text", "text": "Remember the initial child result"}],
+        })],
+    );
+    for message in ["Unread note for later", "Continue the child task"] {
+        assert_eq!(
+            child_requests[1]
+                .inputs_of_type("agent_message")
+                .iter()
+                .filter(|item| item.to_string().contains(message))
+                .count(),
+            1,
+            "resumed child must receive {message} exactly once",
+        );
+    }
+    mcp.shutdown_gracefully().await?;
+    Ok(())
 }

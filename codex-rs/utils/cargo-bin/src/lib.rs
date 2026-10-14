@@ -5,6 +5,11 @@ use std::path::PathBuf;
 
 pub use runfiles;
 
+mod executable;
+pub use executable::copy_executable;
+#[cfg(unix)]
+pub use executable::write_executable;
+
 /// Bazel sets this when runfiles directories are disabled, which we do on all platforms for consistency.
 const RUNFILES_MANIFEST_ONLY_ENV: &str = "RUNFILES_MANIFEST_ONLY";
 
@@ -91,10 +96,15 @@ fn resolve_bin_from_env(key: &str, value: OsString) -> Result<PathBuf, CargoBinE
         let runfiles = runfiles::Runfiles::create().map_err(|err| CargoBinError::CurrentExe {
             source: std::io::Error::other(err),
         })?;
-        if let Some(resolved) = runfiles::rlocation!(runfiles, &raw)
-            && resolved.exists()
-        {
-            return Ok(resolved);
+        if let Some(mut resolved) = runfiles::rlocation!(runfiles, &raw) {
+            if !resolved.is_absolute() {
+                resolved = std::env::current_dir()
+                    .map_err(|source| CargoBinError::CurrentDir { source })?
+                    .join(resolved);
+            }
+            if resolved.exists() {
+                return Ok(resolved);
+            }
         }
     } else if raw.is_absolute() && raw.exists() {
         return Ok(raw);

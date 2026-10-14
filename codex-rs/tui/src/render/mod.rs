@@ -1,8 +1,9 @@
 use ratatui::layout::Rect;
 
-pub mod highlight;
-pub mod line_utils;
-pub mod renderable;
+pub(crate) mod highlight;
+pub(crate) mod line_utils;
+mod model_themes;
+pub(crate) mod renderable;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Insets {

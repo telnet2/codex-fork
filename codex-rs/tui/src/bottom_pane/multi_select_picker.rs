@@ -5,21 +5,38 @@
 //!
 //! - **Fuzzy search**: Type to filter items by name
 //! - **Toggle selection**: Space to toggle items on/off
+//! - **Required selection**: Optional nonempty confirmation; cancellation always remains available
 //! - **Reordering**: Optional left/right arrow support to reorder items
 //! - **Live preview**: Optional callback to show a preview of current selections
 //! - **Callbacks**: Hooks for change, confirm, and cancel events
+//! - **Picker appearance**: Full-width focus with overflow hints in spacer rows;
+//!   checkboxes remain independent of the focused row
 //!
 //! # Example
 //!
 //! ```ignore
-//! let picker = MultiSelectPicker::new(
+//! let picker = MultiSelectPicker::builder(
 //!     "Select Items".to_string(),
 //!     Some("Choose which items to enable".to_string()),
 //!     app_event_tx,
 //! )
 //! .items(vec![
-//!     MultiSelectItem { id: "a".into(), name: "Item A".into(), description: None, enabled: true },
-//!     MultiSelectItem { id: "b".into(), name: "Item B".into(), description: None, enabled: false },
+//!     MultiSelectItem {
+//!         id: "a".into(),
+//!         name: "Item A".into(),
+//!         description: None,
+//!         enabled: true,
+//!         orderable: true,
+//!         section_break_after: false,
+//!     },
+//!     MultiSelectItem {
+//!         id: "b".into(),
+//!         name: "Item B".into(),
+//!         description: None,
+//!         enabled: false,
+//!         orderable: true,
+//!         section_break_after: false,
+//!     },
 //! ])
 //! .on_confirm(|selected_ids, tx| { /* handle confirmation */ })
 //! .build();
@@ -37,16 +54,27 @@ use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::text::Span;
 use ratatui::widgets::Block;
+use ratatui::widgets::Paragraph;
 use ratatui::widgets::Widget;
+use ratatui::widgets::Wrap;
 
+use super::picker_rows;
+use super::picker_style;
+use super::selection_popup_common::ColumnWidthConfig;
 use super::selection_popup_common::GenericDisplayRow;
+use super::selection_popup_common::wrap_styled_line;
 use crate::app_event_sender::AppEventSender;
 use crate::bottom_pane::CancellationEvent;
 use crate::bottom_pane::bottom_pane_view::BottomPaneView;
 use crate::bottom_pane::popup_consts::MAX_POPUP_ROWS;
 use crate::bottom_pane::scroll_state::ScrollState;
-use crate::bottom_pane::selection_popup_common::render_rows_single_line;
+use crate::bottom_pane::selection_popup_common::render_rows_single_line_with_col_width_mode;
 use crate::key_hint;
+use crate::key_hint::KeyBindingListExt;
+use crate::key_hint::is_plain_text_key_event;
+use crate::keymap::ListAction;
+use crate::keymap::ListKeymap;
+use crate::keymap::RuntimeKeymap;
 use crate::line_truncation::truncate_line_with_ellipsis_if_overflow;
 use crate::render::Insets;
 use crate::render::RectExt;
@@ -61,8 +89,7 @@ const ITEM_NAME_TRUNCATE_LEN: usize = 21;
 /// Placeholder text shown in the search input when empty.
 const SEARCH_PLACEHOLDER: &str = "Type to search";
 
-/// Prefix displayed before the search query (mimics a command prompt).
-const SEARCH_PROMPT_PREFIX: &str = "> ";
+const SECTION_BREAK_ROW: &str = "  ───────────────────────";
 
 /// Direction for reordering items in the list.
 enum Direction {
@@ -89,7 +116,6 @@ pub type PreviewCallback = Box<dyn Fn(&[MultiSelectItem]) -> Option<Line<'static
 ///
 /// Each item has a unique identifier, display name, optional description,
 /// and an enabled/disabled state that can be toggled by the user.
-#[derive(Default)]
 pub(crate) struct MultiSelectItem {
     /// Unique identifier returned in the confirm callback when this item is enabled.
     pub id: String,
@@ -102,6 +128,30 @@ pub(crate) struct MultiSelectItem {
 
     /// Whether this item is currently selected/enabled.
     pub enabled: bool,
+
+    /// Whether this item can be moved when ordering is enabled.
+    pub orderable: bool,
+
+    /// Whether to draw a divider after this item when another visible item follows.
+    pub section_break_after: bool,
+}
+
+impl Default for MultiSelectItem {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            description: None,
+            enabled: false,
+            orderable: true,
+            section_break_after: false,
+        }
+    }
+}
+
+struct BuiltRows {
+    rows: Vec<GenericDisplayRow>,
+    state: ScrollState,
 }
 
 /// A multi-select picker widget with fuzzy search and optional reordering.
@@ -114,7 +164,7 @@ pub(crate) struct MultiSelectItem {
 /// - Press Escape to cancel and close
 /// - Use Left/Right arrows to reorder items (if ordering is enabled)
 ///
-/// Create instances using the builder pattern via [`MultiSelectPicker::new`].
+/// Create instances using the builder pattern via [`MultiSelectPicker::builder`].
 pub(crate) struct MultiSelectPicker {
     /// All items in the picker (unfiltered).
     items: Vec<MultiSelectItem>,
@@ -142,6 +192,10 @@ pub(crate) struct MultiSelectPicker {
 
     /// Whether left/right arrow reordering is enabled.
     ordering_enabled: bool,
+    require_selection: bool,
+
+    /// Shared list keybindings for navigation and completion.
+    keymap: ListKeymap,
 
     /// Optional callback to generate a preview line from current item states.
     preview_builder: Option<PreviewCallback>,
@@ -234,39 +288,69 @@ impl MultiSelectPicker {
         MAX_POPUP_ROWS.min(len.max(1))
     }
 
-    /// Calculates the width available for row content (accounts for borders).
-    fn rows_width(total_width: u16) -> u16 {
-        total_width.saturating_sub(2)
+    fn footer_lines(&self, width: u16) -> Vec<Line<'_>> {
+        wrap_styled_line(&self.footer_hint, width.saturating_sub(/*rhs*/ 2))
     }
 
     /// Calculates the height needed for the row list area.
-    fn rows_height(&self, rows: &[GenericDisplayRow]) -> u16 {
-        rows.len().clamp(1, MAX_POPUP_ROWS).try_into().unwrap_or(1)
+    fn rows_height(&self, rows: &BuiltRows) -> u16 {
+        let height: u16 = rows
+            .rows
+            .len()
+            .clamp(/*min*/ 1, MAX_POPUP_ROWS)
+            .try_into()
+            .unwrap_or(/*default*/ 1);
+        height.saturating_add(/*rhs*/ 2)
     }
 
     /// Builds the display rows for all currently visible (filtered) items.
     ///
     /// Each row shows: `› [x] Item Name` where `›` indicates cursor position
     /// and `[x]` or `[ ]` indicates enabled/disabled state.
-    fn build_rows(&self) -> Vec<GenericDisplayRow> {
-        self.filtered_indices
-            .iter()
-            .enumerate()
-            .filter_map(|(visible_idx, actual_idx)| {
-                self.items.get(*actual_idx).map(|item| {
-                    let is_selected = self.state.selected_idx == Some(visible_idx);
-                    let prefix = if is_selected { '›' } else { ' ' };
-                    let marker = if item.enabled { 'x' } else { ' ' };
-                    let item_name = truncate_text(&item.name, ITEM_NAME_TRUNCATE_LEN);
-                    let name = format!("{prefix} [{marker}] {item_name}");
-                    GenericDisplayRow {
-                        name,
-                        description: item.description.clone(),
-                        ..Default::default()
-                    }
-                })
-            })
-            .collect()
+    fn build_rows(&self) -> BuiltRows {
+        let mut rows = Vec::new();
+        let mut visible_to_row = Vec::with_capacity(self.filtered_indices.len());
+        for (visible_idx, actual_idx) in self.filtered_indices.iter().enumerate() {
+            let Some(item) = self.items.get(*actual_idx) else {
+                continue;
+            };
+            visible_to_row.push(rows.len());
+            let is_selected = self.state.selected_idx == Some(visible_idx);
+            let prefix = if is_selected { '›' } else { ' ' };
+            let marker = if item.enabled { 'x' } else { ' ' };
+            let item_name = truncate_text(&item.name, ITEM_NAME_TRUNCATE_LEN);
+            let name = format!("{prefix} [{marker}] {item_name}");
+            rows.push(GenericDisplayRow {
+                name,
+                description: item.description.clone(),
+                selection_style: Some(picker_style::selection_style()),
+                ..Default::default()
+            });
+
+            if item.section_break_after && visible_idx + 1 < self.filtered_indices.len() {
+                rows.push(GenericDisplayRow {
+                    name: SECTION_BREAK_ROW.to_string(),
+                    is_disabled: true,
+                    ..Default::default()
+                });
+            }
+        }
+
+        let selected_idx = self
+            .state
+            .selected_idx
+            .and_then(|visible_idx| visible_to_row.get(visible_idx).copied());
+        let scroll_top = visible_to_row
+            .get(self.state.scroll_top)
+            .copied()
+            .unwrap_or(0);
+        BuiltRows {
+            rows,
+            state: ScrollState {
+                selected_idx,
+                scroll_top,
+            },
+        }
     }
 
     /// Moves the selection cursor up, wrapping to the bottom if at the top.
@@ -283,6 +367,30 @@ impl MultiSelectPicker {
         self.state.move_down_wrap(len);
         let visible = Self::max_visible_rows(len);
         self.state.ensure_visible(len, visible);
+    }
+
+    fn page_up(&mut self) {
+        let len = self.visible_len();
+        let visible = Self::max_visible_rows(len);
+        self.state.page_up_clamped(len, visible);
+    }
+
+    fn page_down(&mut self) {
+        let len = self.visible_len();
+        let visible = Self::max_visible_rows(len);
+        self.state.page_down_clamped(len, visible);
+    }
+
+    fn jump_top(&mut self) {
+        let len = self.visible_len();
+        let visible = Self::max_visible_rows(len);
+        self.state.jump_top(len, visible);
+    }
+
+    fn jump_bottom(&mut self) {
+        let len = self.visible_len();
+        let visible = Self::max_visible_rows(len);
+        self.state.jump_bottom(len, visible);
     }
 
     /// Toggles the enabled state of the currently selected item.
@@ -311,7 +419,8 @@ impl MultiSelectPicker {
     /// Collects the IDs of all enabled items and passes them to the
     /// `on_confirm` callback. Does nothing if already complete.
     fn confirm_selection(&mut self) {
-        if self.complete {
+        if self.complete || (self.require_selection && !self.items.iter().any(|item| item.enabled))
+        {
             return;
         }
         self.complete = true;
@@ -351,11 +460,23 @@ impl MultiSelectPicker {
             return;
         }
 
+        if !self
+            .items
+            .get(actual_idx)
+            .is_some_and(|item| item.orderable)
+        {
+            return;
+        }
+
         let new_idx = match direction {
             Direction::Up if actual_idx > 0 => actual_idx - 1,
             Direction::Down if actual_idx + 1 < len => actual_idx + 1,
             _ => return,
         };
+
+        if !self.items.get(new_idx).is_some_and(|item| item.orderable) {
+            return;
+        }
 
         // move item in underlying list
         self.items.swap(actual_idx, new_idx);
@@ -404,6 +525,10 @@ impl MultiSelectPicker {
 }
 
 impl BottomPaneView for MultiSelectPicker {
+    fn keymap_contexts(&self) -> crate::keymap::KeymapContextSet {
+        crate::keymap::KeymapContextSet::new(crate::keymap::KeymapContext::List)
+    }
+
     fn is_complete(&self) -> bool {
         self.complete
     }
@@ -414,50 +539,41 @@ impl BottomPaneView for MultiSelectPicker {
     }
 
     fn handle_key_event(&mut self, key_event: KeyEvent) {
+        // Printable characters always feed search. Movement aliases such as
+        // plain j/k only apply through non-text events or modified bindings.
+        let allow_plain_char_navigation = !is_plain_text_key_event(key_event);
+
         match key_event {
-            KeyEvent { code: KeyCode::Left, .. } if self.ordering_enabled => {
+            _ if allow_plain_char_navigation
+                && self.ordering_enabled
+                && self.keymap.move_left.is_pressed(key_event) =>
+            {
                 self.move_selected_item(Direction::Up);
             }
-            KeyEvent { code: KeyCode::Right, .. } if self.ordering_enabled => {
+            _ if allow_plain_char_navigation
+                && self.ordering_enabled
+                && self.keymap.move_right.is_pressed(key_event) =>
+            {
                 self.move_selected_item(Direction::Down);
             }
-            KeyEvent {
-                code: KeyCode::Up, ..
+            _ if allow_plain_char_navigation && self.keymap.move_up.is_pressed(key_event) => {
+                self.move_up()
             }
-            | KeyEvent {
-                code: KeyCode::Char('p'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
+            _ if allow_plain_char_navigation && self.keymap.move_down.is_pressed(key_event) => {
+                self.move_down()
             }
-            | KeyEvent {
-                code: KeyCode::Char('k'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
+            _ if allow_plain_char_navigation && self.keymap.page_up.is_pressed(key_event) => {
+                self.page_up()
             }
-            | KeyEvent {
-                code: KeyCode::Char('\u{0010}'),
-                modifiers: KeyModifiers::NONE,
-                ..
-            } /* ^P */ => self.move_up(),
-            KeyEvent {
-                code: KeyCode::Down,
-                ..
+            _ if allow_plain_char_navigation && self.keymap.page_down.is_pressed(key_event) => {
+                self.page_down()
             }
-            | KeyEvent {
-                code: KeyCode::Char('j'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
+            _ if allow_plain_char_navigation && self.keymap.jump_top.is_pressed(key_event) => {
+                self.jump_top()
             }
-            | KeyEvent {
-                code: KeyCode::Char('n'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
+            _ if allow_plain_char_navigation && self.keymap.jump_bottom.is_pressed(key_event) => {
+                self.jump_bottom()
             }
-            | KeyEvent {
-                code: KeyCode::Char('\u{000e}'),
-                modifiers: KeyModifiers::NONE,
-                ..
-            } /* ^N */ => self.move_down(),
             KeyEvent {
                 code: KeyCode::Backspace,
                 ..
@@ -470,15 +586,8 @@ impl BottomPaneView for MultiSelectPicker {
                 modifiers: KeyModifiers::NONE,
                 ..
             } => self.toggle_selected(),
-            KeyEvent {
-                code: KeyCode::Enter,
-                ..
-            } => self.confirm_selection(),
-            KeyEvent {
-                code: KeyCode::Esc, ..
-            } => {
-                self.close();
-            }
+            _ if self.keymap.accept.is_pressed(key_event) => self.confirm_selection(),
+            _ if self.keymap.cancel.is_pressed(key_event) => self.close(),
             KeyEvent {
                 code: KeyCode::Char(c),
                 modifiers,
@@ -502,8 +611,7 @@ impl Renderable for MultiSelectPicker {
 
         let mut height = self.header.desired_height(width.saturating_sub(4));
         height = height.saturating_add(rows_height + 3);
-        height = height.saturating_add(2);
-        height.saturating_add(1 + preview_height)
+        height.saturating_add(self.footer_lines(width).len() as u16 + preview_height)
     }
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
@@ -513,7 +621,9 @@ impl Renderable for MultiSelectPicker {
 
         // Reserve the footer line for the key-hint row.
         let preview_height = if self.preview_line.is_some() { 1 } else { 0 };
-        let footer_height = 1 + preview_height;
+        let hint_lines = self.footer_lines(area.width);
+        let hint_height = hint_lines.len() as u16;
+        let footer_height = hint_height + preview_height;
         let [content_area, footer_area] =
             Layout::vertical([Constraint::Fill(1), Constraint::Length(footer_height)]).areas(area);
 
@@ -525,33 +635,12 @@ impl Renderable for MultiSelectPicker {
             .header
             .desired_height(content_area.width.saturating_sub(4));
         let rows = self.build_rows();
-        let rows_width = Self::rows_width(content_area.width);
         let rows_height = self.rows_height(&rows);
-        let [header_area, _, search_area, list_area] = Layout::vertical([
-            Constraint::Max(header_height),
-            Constraint::Max(1),
-            Constraint::Length(2),
-            Constraint::Length(rows_height),
-        ])
-        .areas(content_area.inset(Insets::vh(/*v*/ 1, /*h*/ 2)));
+        let [header_area, search_area, list_area] =
+            picker_rows::layout(content_area, header_height, /*search*/ 1, rows_height);
 
         self.header.render(header_area, buf);
-
-        // Render the search prompt as two lines to mimic the composer.
-        if search_area.height >= 2 {
-            let [placeholder_area, input_area] =
-                Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(search_area);
-            Line::from(SEARCH_PLACEHOLDER.dim()).render(placeholder_area, buf);
-            let line = if self.search_query.is_empty() {
-                Line::from(vec![SEARCH_PROMPT_PREFIX.dim()])
-            } else {
-                Line::from(vec![
-                    SEARCH_PROMPT_PREFIX.dim(),
-                    self.search_query.clone().into(),
-                ])
-            };
-            line.render(input_area, buf);
-        } else if search_area.height > 0 {
+        if search_area.height > 0 {
             let query_span = if self.search_query.is_empty() {
                 SEARCH_PLACEHOLDER.dim()
             } else {
@@ -561,25 +650,23 @@ impl Renderable for MultiSelectPicker {
         }
 
         if list_area.height > 0 {
-            let render_area = Rect {
-                x: list_area.x.saturating_sub(2),
-                y: list_area.y,
-                width: rows_width.max(1),
-                height: list_area.height,
-            };
-            render_rows_single_line(
-                render_area,
+            let body = list_area.inset(Insets::vh(u16::from(list_area.height >= 3), /*h*/ 0));
+            let rendered = render_rows_single_line_with_col_width_mode(
+                body,
                 buf,
-                &rows,
-                &self.state,
-                render_area.height as usize,
+                &rows.rows,
+                &rows.state,
+                usize::from(body.height),
                 "no matches",
+                ColumnWidthConfig::default(),
             );
+            picker_style::render_scroll_indicators(list_area, buf, rendered);
         }
 
         let hint_area = if let Some(preview_line) = &self.preview_line {
             let [preview_area, hint_area] =
-                Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(footer_area);
+                Layout::vertical([Constraint::Length(1), Constraint::Length(hint_height)])
+                    .areas(footer_area);
             let preview_area = Rect {
                 x: preview_area.x + 2,
                 y: preview_area.y,
@@ -600,7 +687,7 @@ impl Renderable for MultiSelectPicker {
             width: hint_area.width.saturating_sub(2),
             height: hint_area.height,
         };
-        self.footer_hint.clone().dim().render(hint_area, buf);
+        Paragraph::new(hint_lines).dim().render(hint_area, buf);
     }
 }
 
@@ -609,7 +696,7 @@ impl Renderable for MultiSelectPicker {
 /// # Example
 ///
 /// ```ignore
-/// let picker = MultiSelectPicker::new("Title".into(), None, tx)
+/// let picker = MultiSelectPicker::builder("Title".into(), /*subtitle*/ None, tx)
 ///     .items(items)
 ///     .enable_ordering()
 ///     .on_preview(|items| Some(Line::from("Preview")))
@@ -623,7 +710,9 @@ pub(crate) struct MultiSelectPickerBuilder {
     instructions: Vec<Span<'static>>,
     items: Vec<MultiSelectItem>,
     ordering_enabled: bool,
+    require_selection: bool,
     app_event_tx: AppEventSender,
+    keymap: ListKeymap,
     preview_builder: Option<PreviewCallback>,
     on_change: Option<ChangeCallBack>,
     on_confirm: Option<ConfirmCallback>,
@@ -639,7 +728,9 @@ impl MultiSelectPickerBuilder {
             instructions: Vec::new(),
             items: Vec::new(),
             ordering_enabled: false,
+            require_selection: false,
             app_event_tx,
+            keymap: RuntimeKeymap::defaults().list,
             preview_builder: None,
             on_change: None,
             on_confirm: None,
@@ -653,20 +744,17 @@ impl MultiSelectPickerBuilder {
         self
     }
 
-    /// Sets custom instruction spans for the footer hint line.
-    ///
-    /// If not set, default instructions are shown (Space to toggle, Enter to
-    /// confirm, Escape to close).
-    pub fn instructions(mut self, instructions: Vec<Span<'static>>) -> Self {
-        self.instructions = instructions;
-        self
-    }
-
     /// Enables left/right arrow keys for reordering items.
     ///
     /// Reordering is only active when the search query is empty.
     pub fn enable_ordering(mut self) -> Self {
         self.ordering_enabled = true;
+        self
+    }
+
+    /// Sets the shared list keymap used for navigation and completion.
+    pub fn list_keymap(mut self, keymap: ListKeymap) -> Self {
+        self.keymap = keymap;
         self
     }
 
@@ -691,6 +779,12 @@ impl MultiSelectPickerBuilder {
         F: Fn(&[MultiSelectItem], &AppEventSender) + Send + Sync + 'static,
     {
         self.on_change = Some(Box::new(callback));
+        self
+    }
+
+    /// Requires a nonempty selection to confirm without restricting cancellation.
+    pub fn require_selection(mut self) -> Self {
+        self.require_selection = true;
         self
     }
 
@@ -720,22 +814,35 @@ impl MultiSelectPickerBuilder {
     /// preview line if a preview callback was set.
     pub fn build(self) -> MultiSelectPicker {
         let mut header = ColumnRenderable::new();
-        header.push(Line::from(self.title.bold()));
-
+        header.push(Paragraph::new(self.title.bold()).wrap(Wrap { trim: false }));
         if let Some(subtitle) = self.subtitle {
-            header.push(Line::from(subtitle.dim()));
+            header.push(Paragraph::new(subtitle.dim()).wrap(Wrap { trim: false }));
         }
 
         let instructions = if self.instructions.is_empty() {
-            vec![
-                "Press ".into(),
-                key_hint::plain(KeyCode::Char(' ')).into(),
-                " to toggle; ".into(),
-                key_hint::plain(KeyCode::Enter).into(),
-                " to confirm and close; ".into(),
-                key_hint::plain(KeyCode::Esc).into(),
-                " to close".into(),
-            ]
+            let mut spans = vec![key_hint::plain(KeyCode::Char(' ')).into(), " toggle".dim()];
+            if self.ordering_enabled
+                && let (Some(left), Some(right)) = (
+                    self.keymap.primary_hint(ListAction::MoveLeft),
+                    self.keymap.primary_hint(ListAction::MoveRight),
+                )
+            {
+                spans.push(" · ".dim());
+                spans.extend(key_hint::key_label_spans(&format!(
+                    "{}/{}",
+                    left.display_label(),
+                    right.display_label()
+                )));
+                spans.push(" reorder".dim());
+            }
+            for (action, label) in [(ListAction::Accept, "save"), (ListAction::Cancel, "cancel")] {
+                if let Some(hint) = self.keymap.primary_hint(action) {
+                    spans.push(" · ".dim());
+                    spans.extend(hint.spans());
+                    spans.push(format!(" {label}").dim());
+                }
+            }
+            spans
         } else {
             self.instructions
         };
@@ -748,6 +855,8 @@ impl MultiSelectPickerBuilder {
             header: Box::new(header),
             footer_hint: Line::from(instructions),
             ordering_enabled: self.ordering_enabled,
+            require_selection: self.require_selection,
+            keymap: self.keymap,
             search_query: String::new(),
             filtered_indices: Vec::new(),
             preview_builder: self.preview_builder,
@@ -792,4 +901,296 @@ pub(crate) fn match_item(
         return Some((None, score));
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app_event::AppEvent;
+    use pretty_assertions::assert_eq;
+    use tokio::sync::mpsc::unbounded_channel;
+
+    fn test_picker(items: Vec<MultiSelectItem>) -> MultiSelectPicker {
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        MultiSelectPicker::builder(
+            "Test".to_string(),
+            /*subtitle*/ None,
+            AppEventSender::new(tx),
+        )
+        .items(items)
+        .enable_ordering()
+        .build()
+    }
+
+    fn item(id: &str, orderable: bool, section_break_after: bool) -> MultiSelectItem {
+        MultiSelectItem {
+            id: id.to_string(),
+            name: id.to_string(),
+            orderable,
+            section_break_after,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn non_orderable_items_cannot_move_or_be_crossed() {
+        let mut picker = test_picker(vec![
+            item(
+                "theme-colors",
+                /*orderable*/ false,
+                /*section_break_after*/ true,
+            ),
+            item(
+                "model", /*orderable*/ true, /*section_break_after*/ false,
+            ),
+            item(
+                "branch", /*orderable*/ true, /*section_break_after*/ false,
+            ),
+        ]);
+
+        picker.move_selected_item(Direction::Down);
+        assert_eq!(
+            picker
+                .items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["theme-colors", "model", "branch"]
+        );
+
+        picker.move_down();
+        picker.move_selected_item(Direction::Up);
+        assert_eq!(
+            picker
+                .items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["theme-colors", "model", "branch"]
+        );
+    }
+
+    #[test]
+    fn horizontal_list_keys_reorder_orderable_items() {
+        let mut picker = test_picker(vec![
+            item(
+                "model", /*orderable*/ true, /*section_break_after*/ false,
+            ),
+            item(
+                "branch", /*orderable*/ true, /*section_break_after*/ false,
+            ),
+        ]);
+
+        picker.handle_key_event(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
+        assert_eq!(
+            picker
+                .items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["branch", "model"]
+        );
+
+        picker.handle_key_event(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+        assert_eq!(
+            picker
+                .items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["model", "branch"]
+        );
+    }
+
+    #[test]
+    fn section_break_after_item_renders_separator_row() {
+        let picker = test_picker(vec![
+            item(
+                "theme-colors",
+                /*orderable*/ false,
+                /*section_break_after*/ true,
+            ),
+            item(
+                "model", /*orderable*/ true, /*section_break_after*/ false,
+            ),
+        ]);
+
+        let rows = picker.build_rows();
+
+        assert_eq!(
+            rows.rows
+                .iter()
+                .map(|row| row.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["› [ ] theme-colors", SECTION_BREAK_ROW, "  [ ] model"]
+        );
+        assert_eq!(rows.state.selected_idx, Some(0));
+    }
+
+    #[test]
+    fn searchable_plain_j_updates_query_instead_of_navigating() {
+        let mut picker = test_picker(vec![
+            item(
+                "alpha", /*orderable*/ true, /*section_break_after*/ false,
+            ),
+            item(
+                "jupiter", /*orderable*/ true, /*section_break_after*/ false,
+            ),
+        ]);
+
+        picker.handle_key_event(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+
+        assert_eq!(picker.search_query, "j");
+        assert_eq!(picker.filtered_indices, vec![1]);
+        assert_eq!(picker.state.selected_idx, Some(0));
+    }
+
+    #[test]
+    fn page_and_jump_navigation_use_list_keymap() {
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let mut keymap = RuntimeKeymap::defaults().list;
+        keymap.page_down = vec![key_hint::ctrl(KeyCode::Char('d'))];
+        keymap.page_up = vec![key_hint::ctrl(KeyCode::Char('u'))];
+        keymap.jump_bottom = vec![key_hint::ctrl(KeyCode::Char('e'))];
+        keymap.jump_top = vec![key_hint::ctrl(KeyCode::Char('a'))];
+        let mut picker = MultiSelectPicker::builder(
+            "Test".to_string(),
+            /*subtitle*/ None,
+            AppEventSender::new(tx),
+        )
+        .items(
+            (0..12)
+                .map(|idx| {
+                    item(
+                        &format!("item-{idx}"),
+                        /*orderable*/ true,
+                        /*section_break_after*/ false,
+                    )
+                })
+                .collect(),
+        )
+        .list_keymap(keymap)
+        .build();
+
+        picker.handle_key_event(KeyEvent::from(KeyCode::PageDown));
+        assert_eq!(picker.state.selected_idx, Some(0));
+
+        picker.handle_key_event(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert_eq!(picker.state.selected_idx, Some(8));
+
+        picker.handle_key_event(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(picker.state.selected_idx, Some(0));
+
+        picker.handle_key_event(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        assert_eq!(picker.state.selected_idx, Some(11));
+
+        picker.handle_key_event(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert_eq!(picker.state.selected_idx, Some(0));
+    }
+
+    #[test]
+    fn short_picker_preserves_selected_row_when_overflow_spacers_yield() {
+        let mut picker = test_picker(
+            (0..12)
+                .map(|index| {
+                    item(
+                        &format!("field-{index:02}"),
+                        /*orderable*/ true,
+                        /*section_break_after*/ false,
+                    )
+                })
+                .collect(),
+        );
+        picker.header = Box::new(());
+        picker.jump_bottom();
+        let mut snapshots = Vec::new();
+        for height in 1..=7 {
+            let area = Rect::new(/*x*/ 0, /*y*/ 0, /*width*/ 80, height);
+            let mut buf = Buffer::empty(area);
+            picker.render(area, &mut buf);
+            let text = buf
+                .content
+                .chunks(usize::from(area.width))
+                .map(|row| {
+                    row.iter()
+                        .map(ratatui::buffer::Cell::symbol)
+                        .collect::<String>()
+                        .trim_end()
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if height >= 4 {
+                assert!(text.contains("› [ ] field-11"), "{text}");
+            }
+            assert_eq!(picker.state.selected_idx, Some(11));
+            snapshots.push(format!("height={height}\n{text}"));
+        }
+        picker.toggle_selected();
+        assert_eq!(
+            picker
+                .items
+                .iter()
+                .filter(|item| item.enabled)
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["field-11"]
+        );
+        insta::assert_snapshot!(snapshots.join("\n\n"));
+    }
+
+    #[test]
+    fn picker_appearance_renders_checkboxes_preview_and_overflow() {
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let mut picker = MultiSelectPicker::builder(
+            "Status line".to_string(),
+            /*subtitle*/ None,
+            AppEventSender::new(tx),
+        )
+        .items(
+            (0..12)
+                .map(|index| MultiSelectItem {
+                    id: format!("field-{index}"),
+                    name: format!("Field {index}"),
+                    description: Some("Status detail".to_string()),
+                    enabled: index == 0,
+                    section_break_after: index == 0,
+                    ..Default::default()
+                })
+                .collect(),
+        )
+        .enable_ordering()
+        .on_preview(|items| {
+            Some(Line::from(
+                items
+                    .iter()
+                    .filter(|item| item.enabled)
+                    .map(|item| item.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" · "),
+            ))
+        })
+        .build();
+        let render = |picker: &MultiSelectPicker| {
+            let area = Rect::new(
+                /*x*/ 0,
+                /*y*/ 0,
+                /*width*/ 48,
+                picker.desired_height(/*width*/ 48),
+            );
+            let mut buf = Buffer::empty(area);
+            picker.render(area, &mut buf);
+            buf
+        };
+        let first = render(&picker);
+        picker.jump_bottom();
+        picker.toggle_selected();
+        picker.move_selected_item(Direction::Up);
+        let last = render(&picker);
+        picker.handle_key_event(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+        let empty = render(&picker);
+        insta::assert_snapshot!(format!(
+            "First page:\n{first:?}\nLast page:\n{last:?}\nNo matches:\n{empty:?}"
+        ));
+    }
 }

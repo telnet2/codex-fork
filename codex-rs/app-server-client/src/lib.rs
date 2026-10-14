@@ -1,3 +1,7 @@
+// Release builds exceed rustc's default query depth when laying out the async
+// MessageProcessor::handle_initialized_client_request future.
+#![recursion_limit = "256"]
+
 //! Shared in-process app-server client facade for CLI surfaces.
 //!
 //! This crate wraps [`codex_app_server::in_process`] behind a single async API
@@ -7,15 +11,19 @@
 //! - Typed caller-provided startup identity (`SessionSource` + client name).
 //! - Typed and raw request/notification dispatch.
 //! - Server request resolution and rejection.
-//! - Event consumption with backpressure signaling ([`InProcessServerEvent::Lagged`]).
+//! - Ordered, lossless event consumption that cannot block request processing.
 //! - Bounded graceful shutdown with abort fallback.
 //!
 //! The facade interposes a worker task between the caller and the underlying
 //! [`InProcessClientHandle`](codex_app_server::in_process::InProcessClientHandle),
-//! bridging async `mpsc` channels on both sides. Queues are bounded so overload
-//! surfaces as channel-full errors rather than unbounded memory growth.
+//! bridging async `mpsc` channels on both sides. Commands and the underlying
+//! runtime remain bounded; the local consumer event queue is unbounded so
+//! unread notifications cannot prevent request responses from being delivered.
 
+mod path;
 mod remote;
+mod server_request;
+pub use server_request::AppServerReplyHandle;
 
 use std::error::Error;
 use std::fmt;
@@ -25,9 +33,13 @@ use std::io::Result as IoResult;
 use std::sync::Arc;
 use std::time::Duration;
 
+pub use codex_app_server::app_server_control_socket_path;
 pub use codex_app_server::in_process::DEFAULT_IN_PROCESS_CHANNEL_CAPACITY;
+pub use codex_app_server::in_process::EmbeddedNetworkPolicy;
 pub use codex_app_server::in_process::InProcessServerEvent;
 use codex_app_server::in_process::InProcessStartArgs;
+use codex_app_server::in_process::LogDbLayer;
+pub use codex_app_server::in_process::StateDbHandle;
 use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::ClientNotification;
 use codex_app_server_protocol::ClientRequest;
@@ -35,21 +47,21 @@ use codex_app_server_protocol::ConfigWarningNotification;
 use codex_app_server_protocol::InitializeCapabilities;
 use codex_app_server_protocol::InitializeParams;
 use codex_app_server_protocol::JSONRPCErrorError;
-use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::Result as JsonRpcResult;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 use codex_arg0::Arg0DispatchPaths;
-use codex_core::AuthManager;
-use codex_core::ThreadManager;
+use codex_config::CloudConfigBundleLoader;
+use codex_config::LoaderOverrides;
+use codex_config::NoopThreadConfigLoader;
 use codex_core::config::Config;
-use codex_core::config_loader::CloudRequirementsLoader;
-use codex_core::config_loader::LoaderOverrides;
-use codex_core::models_manager::collaboration_mode_presets::CollaborationModesConfig;
-use codex_features::Feature;
+pub use codex_core::otel_init::build_provider as build_otel_provider;
+pub use codex_exec_server::EnvironmentManager;
+pub use codex_exec_server::ExecServerRuntimeOptions;
 use codex_feedback::CodexFeedback;
 use codex_protocol::protocol::SessionSource;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use serde::de::DeserializeOwned;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -57,10 +69,29 @@ use tokio::time::timeout;
 use toml::Value as TomlValue;
 use tracing::warn;
 
+pub use crate::path::AppServerPath;
 pub use crate::remote::RemoteAppServerClient;
 pub use crate::remote::RemoteAppServerConnectArgs;
+pub use crate::remote::RemoteAppServerEndpoint;
+
+/// Transitional access to core-only embedded app-server types.
+///
+/// New TUI behavior should prefer the app-server protocol methods. This
+/// module exists so clients can remove a direct `codex-core` dependency
+/// while legacy startup/config paths are migrated to RPCs.
+pub mod legacy_core {
+    pub mod config {
+        pub use codex_core::config::*;
+
+        pub mod edit {
+            pub use codex_core::config::edit::*;
+        }
+    }
+}
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+// Covers the embedded drain, its analytics flush, and final task join.
+const IN_PROCESS_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Raw app-server request result for typed in-process requests.
 ///
@@ -72,9 +103,8 @@ pub type RequestResult = std::result::Result<JsonRpcResult, JSONRPCErrorError>;
 #[derive(Debug, Clone)]
 pub enum AppServerEvent {
     Lagged { skipped: usize },
-    ServerNotification(ServerNotification),
-    LegacyNotification(JSONRPCNotification),
-    ServerRequest(ServerRequest),
+    ServerNotification(Box<ServerNotification>),
+    ServerRequest(Box<ServerRequest>),
     Disconnected { message: String },
 }
 
@@ -85,30 +115,8 @@ impl From<InProcessServerEvent> for AppServerEvent {
             InProcessServerEvent::ServerNotification(notification) => {
                 Self::ServerNotification(notification)
             }
-            InProcessServerEvent::LegacyNotification(notification) => {
-                Self::LegacyNotification(notification)
-            }
             InProcessServerEvent::ServerRequest(request) => Self::ServerRequest(request),
         }
-    }
-}
-
-fn event_requires_delivery(event: &InProcessServerEvent) -> bool {
-    // These terminal events drive surface shutdown/completion state. Dropping
-    // them under backpressure can leave exec/TUI waiting forever even though
-    // the underlying turn has already ended.
-    match event {
-        InProcessServerEvent::ServerNotification(
-            codex_app_server_protocol::ServerNotification::TurnCompleted(_),
-        ) => true,
-        InProcessServerEvent::LegacyNotification(notification) => matches!(
-            notification
-                .method
-                .strip_prefix("codex/event/")
-                .unwrap_or(&notification.method),
-            "task_complete" | "turn_aborted" | "shutdown_complete"
-        ),
-        _ => false,
     }
 }
 
@@ -140,7 +148,15 @@ impl fmt::Display for TypedRequestError {
                 write!(f, "{method} transport error: {source}")
             }
             Self::Server { method, source } => {
-                write!(f, "{method} failed: {}", source.message)
+                write!(
+                    f,
+                    "{method} failed: {} (code {})",
+                    source.message, source.code
+                )?;
+                if let Some(data) = source.data.as_ref() {
+                    write!(f, ", data: {data}")?;
+                }
+                Ok(())
             }
             Self::Deserialize { method, source } => {
                 write!(f, "{method} response decode error: {source}")
@@ -159,14 +175,27 @@ impl Error for TypedRequestError {
     }
 }
 
-#[derive(Clone)]
-struct SharedCoreManagers {
-    // Temporary bootstrap escape hatch for embedders that still need direct
-    // core handles during the in-process app-server migration. Once TUI/exec
-    // stop depending on direct manager access, remove this wrapper and keep
-    // manager ownership entirely inside the app-server runtime.
-    auth_manager: Arc<AuthManager>,
-    thread_manager: Arc<ThreadManager>,
+// Await transport in a separate statement before calling this: dropping the
+// completed future must precede any caller-provided Deserialize implementation.
+fn decode_typed_response<T>(
+    method: &str,
+    response: IoResult<RequestResult>,
+) -> Result<T, TypedRequestError>
+where
+    T: DeserializeOwned,
+{
+    let response = response.map_err(|source| TypedRequestError::Transport {
+        method: method.to_string(),
+        source,
+    })?;
+    let result = response.map_err(|source| TypedRequestError::Server {
+        method: method.to_string(),
+        source,
+    })?;
+    serde_json::from_value(result).map_err(|source| TypedRequestError::Deserialize {
+        method: method.to_string(),
+        source,
+    })
 }
 
 #[derive(Clone)]
@@ -179,10 +208,20 @@ pub struct InProcessClientStartArgs {
     pub cli_overrides: Vec<(String, TomlValue)>,
     /// Loader override knobs used by config API paths.
     pub loader_overrides: LoaderOverrides,
-    /// Preloaded cloud requirements provider.
-    pub cloud_requirements: CloudRequirementsLoader,
+    /// Whether config API paths should reject unknown config fields.
+    pub strict_config: bool,
+    /// Preloaded cloud config bundle provider.
+    pub cloud_config_bundle: CloudConfigBundleLoader,
+    /// Policy shared with transports created by the embedder before startup.
+    pub embedded_network_policy: EmbeddedNetworkPolicy,
     /// Feedback sink used by app-server/core telemetry and logs.
     pub feedback: CodexFeedback,
+    /// SQLite tracing layer used to flush recently emitted logs before feedback upload.
+    pub log_db: Option<LogDbLayer>,
+    /// Process-wide SQLite state handle shared with the embedded app-server.
+    pub state_db: Option<StateDbHandle>,
+    /// Environment manager used by core execution and filesystem operations.
+    pub environment_manager: Arc<EnvironmentManager>,
     /// Startup warnings emitted after initialize succeeds.
     pub config_warnings: Vec<ConfigWarningNotification>,
     /// Session source recorded in app-server thread metadata.
@@ -195,46 +234,28 @@ pub struct InProcessClientStartArgs {
     pub client_version: String,
     /// Whether experimental APIs are requested at initialize time.
     pub experimental_api: bool,
+    /// Whether MCP servers may send `openai/form` elicitation requests.
+    pub mcp_server_openai_form_elicitation: bool,
     /// Notification methods this client opts out of receiving.
     pub opt_out_notification_methods: Vec<String>,
-    /// Queue capacity for command/event channels (clamped to at least 1).
+    /// Queue capacity for command and embedded-runtime channels (clamped to at least 1).
     pub channel_capacity: usize,
 }
 
 impl InProcessClientStartArgs {
-    fn shared_core_managers(&self) -> SharedCoreManagers {
-        let auth_manager = AuthManager::shared(
-            self.config.codex_home.clone(),
-            self.enable_codex_api_key_env,
-            self.config.cli_auth_credentials_store_mode,
-        );
-        let thread_manager = Arc::new(ThreadManager::new(
-            self.config.as_ref(),
-            auth_manager.clone(),
-            self.session_source.clone(),
-            CollaborationModesConfig {
-                default_mode_request_user_input: self
-                    .config
-                    .features
-                    .enabled(Feature::DefaultModeRequestUserInput),
-            },
-        ));
-
-        SharedCoreManagers {
-            auth_manager,
-            thread_manager,
-        }
-    }
-
     /// Builds initialize params from caller-provided metadata.
     pub fn initialize_params(&self) -> InitializeParams {
         let capabilities = InitializeCapabilities {
+            explicit_gateway_oauth: false,
             experimental_api: self.experimental_api,
+            request_attestation: false,
+            extensions: None,
             opt_out_notification_methods: if self.opt_out_notification_methods.is_empty() {
                 None
             } else {
                 Some(self.opt_out_notification_methods.clone())
             },
+            mcp_server_openai_form_elicitation: self.mcp_server_openai_form_elicitation,
         };
 
         InitializeParams {
@@ -247,17 +268,21 @@ impl InProcessClientStartArgs {
         }
     }
 
-    fn into_runtime_start_args(self, shared_core: &SharedCoreManagers) -> InProcessStartArgs {
+    fn into_runtime_start_args(self) -> InProcessStartArgs {
         let initialize = self.initialize_params();
         InProcessStartArgs {
             arg0_paths: self.arg0_paths,
             config: self.config,
             cli_overrides: self.cli_overrides,
             loader_overrides: self.loader_overrides,
-            cloud_requirements: self.cloud_requirements,
-            auth_manager: Some(shared_core.auth_manager.clone()),
-            thread_manager: Some(shared_core.thread_manager.clone()),
+            strict_config: self.strict_config,
+            cloud_config_bundle: self.cloud_config_bundle,
+            embedded_network_policy: self.embedded_network_policy,
+            thread_config_loader: Arc::new(NoopThreadConfigLoader),
             feedback: self.feedback,
+            log_db: self.log_db,
+            state_db: self.state_db,
+            environment_manager: self.environment_manager,
             config_warnings: self.config_warnings,
             session_source: self.session_source,
             enable_codex_api_key_env: self.enable_codex_api_key_env,
@@ -308,10 +333,8 @@ enum ClientCommand {
 /// boundary.
 pub struct InProcessAppServerClient {
     command_tx: mpsc::Sender<ClientCommand>,
-    event_rx: mpsc::Receiver<InProcessServerEvent>,
+    event_rx: mpsc::UnboundedReceiver<InProcessServerEvent>,
     worker_handle: tokio::task::JoinHandle<()>,
-    auth_manager: Arc<AuthManager>,
-    thread_manager: Arc<ThreadManager>,
 }
 
 #[derive(Clone)]
@@ -333,21 +356,22 @@ pub enum AppServerClient {
 impl InProcessAppServerClient {
     /// Starts the in-process runtime and facade worker task.
     ///
-    /// The returned client is ready for requests and event consumption. If the
-    /// internal event queue is saturated later, server requests are rejected
-    /// with overload error instead of being silently dropped.
+    /// The returned client is ready for requests and ordered event consumption.
+    /// Request queues remain bounded without blocking on unread notifications.
     pub async fn start(args: InProcessClientStartArgs) -> IoResult<Self> {
         let channel_capacity = args.channel_capacity.max(1);
-        let shared_core = args.shared_core_managers();
         let mut handle =
-            codex_app_server::in_process::start(args.into_runtime_start_args(&shared_core)).await?;
+            codex_app_server::in_process::start(args.into_runtime_start_args()).await?;
         let request_sender = handle.sender();
         let (command_tx, mut command_rx) = mpsc::channel::<ClientCommand>(channel_capacity);
-        let (event_tx, event_rx) = mpsc::channel::<InProcessServerEvent>(channel_capacity);
+        // e9996ec62a preserved transcript events by awaiting a bounded queue, but that can
+        // deadlock a foreground request whose response is behind unread notifications.
+        // Match the remote-client fix in 79ea57715636: only this local consumer queue is
+        // unbounded; commands and the embedded runtime stay bounded and events remain ordered.
+        let (event_tx, event_rx) = mpsc::unbounded_channel::<InProcessServerEvent>();
 
         let worker_handle = tokio::spawn(async move {
             let mut event_stream_enabled = true;
-            let mut skipped_events = 0usize;
             loop {
                 tokio::select! {
                     command = command_rx.recv() => {
@@ -358,8 +382,20 @@ impl InProcessAppServerClient {
                                 // this loop can keep draining runtime events
                                 // while the request is blocked on client input.
                                 tokio::spawn(async move {
-                                    let result = request_sender.request(*request).await;
-                                    let _ = response_tx.send(result);
+                                    // Device ceremonies belong to the waiting UI. Preserve
+                                    // its cancellation through this buffering task.
+                                    let cancellable = matches!(*request,
+                                        ClientRequest::UserVerificationStatus { .. }
+                                        | ClientRequest::UserVerificationEnroll { .. }
+                                        | ClientRequest::UserVerificationDelete { .. }
+                                        | ClientRequest::UserVerificationVerify { .. });
+                                    let mut response_tx = response_tx;
+                                    tokio::select! {
+                                        _ = response_tx.closed(), if cancellable => {}
+                                        result = request_sender.request(*request) => {
+                                            let _ = response_tx.send(result);
+                                        }
+                                    }
                                 });
                             }
                             Some(ClientCommand::Notify {
@@ -401,86 +437,28 @@ impl InProcessAppServerClient {
                         let Some(event) = event else {
                             break;
                         };
-
-                        if skipped_events > 0 {
-                            if event_requires_delivery(&event) {
-                                // Surface lag before the terminal event, but
-                                // do not let the lag marker itself cause us to
-                                // drop the completion/abort notification that
-                                // the caller is blocked on.
-                                if event_tx
-                                    .send(InProcessServerEvent::Lagged {
-                                        skipped: skipped_events,
-                                    })
-                                    .await
-                                    .is_err()
-                                {
-                                    event_stream_enabled = false;
-                                    continue;
-                                }
-                                skipped_events = 0;
-                            } else {
-                                match event_tx.try_send(InProcessServerEvent::Lagged {
-                                    skipped: skipped_events,
-                                }) {
-                                    Ok(()) => {
-                                        skipped_events = 0;
-                                    }
-                                    Err(mpsc::error::TrySendError::Full(_)) => {
-                                        skipped_events = skipped_events.saturating_add(1);
-                                        warn!(
-                                            "dropping in-process app-server event because consumer queue is full"
-                                        );
-                                        if let InProcessServerEvent::ServerRequest(request) = event {
-                                            let _ = request_sender.fail_server_request(
-                                                request.id().clone(),
-                                                JSONRPCErrorError {
-                                                    code: -32001,
-                                                    message: "in-process app-server event queue is full".to_string(),
-                                                    data: None,
-                                                },
-                                            );
-                                        }
-                                        continue;
-                                    }
-                                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                                        event_stream_enabled = false;
-                                        continue;
-                                    }
-                                }
-                            }
-                        }
-
-                        if event_requires_delivery(&event) {
-                            // Block until the consumer catches up for
-                            // terminal notifications; this preserves the
-                            // completion signal even when the queue is
-                            // otherwise saturated.
-                            if event_tx.send(event).await.is_err() {
-                                event_stream_enabled = false;
+                        if let InProcessServerEvent::ServerRequest(request) = &event
+                            && let ServerRequest::ChatgptAuthTokensRefresh { request_id, .. } =
+                                request.as_ref()
+                        {
+                            let send_result = request_sender.fail_server_request(
+                                request_id.clone(),
+                                JSONRPCErrorError {
+                                    code: -32000,
+                                    message: "chatgpt auth token refresh is not supported for in-process app-server clients".to_string(),
+                                    data: None,
+                                },
+                            );
+                            if let Err(err) = send_result {
+                                warn!(
+                                    "failed to reject unsupported chatgpt auth token refresh request: {err}"
+                                );
                             }
                             continue;
                         }
 
-                        match event_tx.try_send(event) {
-                            Ok(()) => {}
-                            Err(mpsc::error::TrySendError::Full(event)) => {
-                                skipped_events = skipped_events.saturating_add(1);
-                                warn!("dropping in-process app-server event because consumer queue is full");
-                                if let InProcessServerEvent::ServerRequest(request) = event {
-                                    let _ = request_sender.fail_server_request(
-                                        request.id().clone(),
-                                        JSONRPCErrorError {
-                                            code: -32001,
-                                            message: "in-process app-server event queue is full".to_string(),
-                                            data: None,
-                                        },
-                                    );
-                                }
-                            }
-                            Err(mpsc::error::TrySendError::Closed(_)) => {
-                                event_stream_enabled = false;
-                            }
+                        if event_tx.send(event).is_err() {
+                            event_stream_enabled = false;
                         }
                     }
                 }
@@ -491,19 +469,7 @@ impl InProcessAppServerClient {
             command_tx,
             event_rx,
             worker_handle,
-            auth_manager: shared_core.auth_manager,
-            thread_manager: shared_core.thread_manager,
         })
-    }
-
-    /// Temporary bootstrap escape hatch for embedders migrating toward RPC-only usage.
-    pub fn auth_manager(&self) -> Arc<AuthManager> {
-        self.auth_manager.clone()
-    }
-
-    /// Temporary bootstrap escape hatch for embedders migrating toward RPC-only usage.
-    pub fn thread_manager(&self) -> Arc<ThreadManager> {
-        self.thread_manager.clone()
     }
 
     pub fn request_handle(&self) -> InProcessAppServerRequestHandle {
@@ -548,20 +514,9 @@ impl InProcessAppServerClient {
     where
         T: DeserializeOwned,
     {
-        let method = request_method_name(&request);
-        let response =
-            self.request(request)
-                .await
-                .map_err(|source| TypedRequestError::Transport {
-                    method: method.clone(),
-                    source,
-                })?;
-        let result = response.map_err(|source| TypedRequestError::Server {
-            method: method.clone(),
-            source,
-        })?;
-        serde_json::from_value(result)
-            .map_err(|source| TypedRequestError::Deserialize { method, source })
+        let method = request.method_name();
+        let response = self.request(request).await;
+        decode_typed_response(method, response)
     }
 
     /// Sends a typed client notification.
@@ -596,6 +551,71 @@ impl InProcessAppServerClient {
         request_id: RequestId,
         result: JsonRpcResult,
     ) -> IoResult<()> {
+        self.request_handle()
+            .resolve_server_request(request_id, result)
+            .await
+    }
+
+    /// Rejects a pending server request with JSON-RPC error payload.
+    pub async fn reject_server_request(
+        &self,
+        request_id: RequestId,
+        error: JSONRPCErrorError,
+    ) -> IoResult<()> {
+        self.request_handle()
+            .reject_server_request(request_id, error)
+            .await
+    }
+
+    /// Returns the next in-process event, or `None` when worker exits.
+    ///
+    /// Events remain ordered and are retained while callers await requests.
+    pub async fn next_event(&mut self) -> Option<InProcessServerEvent> {
+        self.event_rx.recv().await
+    }
+
+    /// Shuts down worker and in-process runtime with bounded wait.
+    ///
+    /// If graceful shutdown exceeds timeout, the worker task is aborted to
+    /// avoid leaking background tasks in embedding callers.
+    pub async fn shutdown(self) -> IoResult<()> {
+        let Self {
+            command_tx,
+            event_rx,
+            worker_handle,
+        } = self;
+        let mut worker_handle = worker_handle;
+        // Stop forwarding caller-facing events before asking the worker to shut down.
+        drop(event_rx);
+        let (response_tx, response_rx) = oneshot::channel();
+        if command_tx
+            .send(ClientCommand::Shutdown { response_tx })
+            .await
+            .is_ok()
+            && let Ok(command_result) = timeout(IN_PROCESS_SHUTDOWN_TIMEOUT, response_rx).await
+        {
+            command_result.map_err(|_| {
+                IoError::new(
+                    ErrorKind::BrokenPipe,
+                    "in-process app-server shutdown channel is closed",
+                )
+            })??;
+        }
+
+        if let Err(_elapsed) = timeout(IN_PROCESS_SHUTDOWN_TIMEOUT, &mut worker_handle).await {
+            worker_handle.abort();
+            let _ = worker_handle.await;
+        }
+        Ok(())
+    }
+}
+
+impl InProcessAppServerRequestHandle {
+    pub(crate) async fn resolve_server_request(
+        &self,
+        request_id: RequestId,
+        result: JsonRpcResult,
+    ) -> IoResult<()> {
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
             .send(ClientCommand::ResolveServerRequest {
@@ -619,7 +639,7 @@ impl InProcessAppServerClient {
     }
 
     /// Rejects a pending server request with JSON-RPC error payload.
-    pub async fn reject_server_request(
+    pub(crate) async fn reject_server_request(
         &self,
         request_id: RequestId,
         error: JSONRPCErrorError,
@@ -646,57 +666,6 @@ impl InProcessAppServerClient {
         })?
     }
 
-    /// Returns the next in-process event, or `None` when worker exits.
-    ///
-    /// Callers are expected to drain this stream promptly. If they fall behind,
-    /// the worker emits [`InProcessServerEvent::Lagged`] markers and may reject
-    /// pending server requests rather than letting approval flows hang.
-    pub async fn next_event(&mut self) -> Option<InProcessServerEvent> {
-        self.event_rx.recv().await
-    }
-
-    /// Shuts down worker and in-process runtime with bounded wait.
-    ///
-    /// If graceful shutdown exceeds timeout, the worker task is aborted to
-    /// avoid leaking background tasks in embedding callers.
-    pub async fn shutdown(self) -> IoResult<()> {
-        let Self {
-            command_tx,
-            event_rx,
-            worker_handle,
-            auth_manager: _,
-            thread_manager: _,
-        } = self;
-        let mut worker_handle = worker_handle;
-        // Drop the caller-facing receiver before asking the worker to shut
-        // down. That unblocks any pending must-deliver `event_tx.send(..)`
-        // so the worker can reach `handle.shutdown()` instead of timing out
-        // and getting aborted with the runtime still attached.
-        drop(event_rx);
-        let (response_tx, response_rx) = oneshot::channel();
-        if command_tx
-            .send(ClientCommand::Shutdown { response_tx })
-            .await
-            .is_ok()
-            && let Ok(command_result) = timeout(SHUTDOWN_TIMEOUT, response_rx).await
-        {
-            command_result.map_err(|_| {
-                IoError::new(
-                    ErrorKind::BrokenPipe,
-                    "in-process app-server shutdown channel is closed",
-                )
-            })??;
-        }
-
-        if let Err(_elapsed) = timeout(SHUTDOWN_TIMEOUT, &mut worker_handle).await {
-            worker_handle.abort();
-            let _ = worker_handle.await;
-        }
-        Ok(())
-    }
-}
-
-impl InProcessAppServerRequestHandle {
     pub async fn request(&self, request: ClientRequest) -> IoResult<RequestResult> {
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
@@ -723,24 +692,35 @@ impl InProcessAppServerRequestHandle {
     where
         T: DeserializeOwned,
     {
-        let method = request_method_name(&request);
-        let response =
-            self.request(request)
-                .await
-                .map_err(|source| TypedRequestError::Transport {
-                    method: method.clone(),
-                    source,
-                })?;
-        let result = response.map_err(|source| TypedRequestError::Server {
-            method: method.clone(),
-            source,
-        })?;
-        serde_json::from_value(result)
-            .map_err(|source| TypedRequestError::Deserialize { method, source })
+        let method = request.method_name();
+        let response = self.request(request).await;
+        decode_typed_response(method, response)
     }
 }
 
 impl AppServerRequestHandle {
+    pub(crate) async fn resolve_server_request(
+        &self,
+        request_id: RequestId,
+        result: JsonRpcResult,
+    ) -> IoResult<()> {
+        match self {
+            Self::InProcess(handle) => handle.resolve_server_request(request_id, result).await,
+            Self::Remote(handle) => handle.resolve_server_request(request_id, result).await,
+        }
+    }
+
+    pub(crate) async fn reject_server_request(
+        &self,
+        request_id: RequestId,
+        error: JSONRPCErrorError,
+    ) -> IoResult<()> {
+        match self {
+            Self::InProcess(handle) => handle.reject_server_request(request_id, error).await,
+            Self::Remote(handle) => handle.reject_server_request(request_id, error).await,
+        }
+    }
+
     pub async fn request(&self, request: ClientRequest) -> IoResult<RequestResult> {
         match self {
             Self::InProcess(handle) => handle.request(request).await,
@@ -752,14 +732,39 @@ impl AppServerRequestHandle {
     where
         T: DeserializeOwned,
     {
-        match self {
-            Self::InProcess(handle) => handle.request_typed(request).await,
-            Self::Remote(handle) => handle.request_typed(request).await,
-        }
+        let method = request.method_name();
+        let response = self.request(request).await;
+        decode_typed_response(method, response)
     }
 }
 
 impl AppServerClient {
+    /// App-server platform family, which can differ from the executor's platform.
+    /// Older remote servers may omit this metadata.
+    pub fn platform_family(&self) -> Option<&str> {
+        match self {
+            Self::InProcess(_) => Some(std::env::consts::FAMILY),
+            Self::Remote(client) => client.platform_family(),
+        }
+    }
+
+    /// App-server operating system as reported at initialization, including unknown values.
+    pub fn platform_os(&self) -> Option<&str> {
+        match self {
+            Self::InProcess(_) => Some(std::env::consts::OS),
+            Self::Remote(client) => client.platform_os(),
+        }
+    }
+
+    pub fn codex_home(&self, local_codex_home: &AbsolutePathBuf) -> Option<AppServerPath> {
+        match self {
+            Self::InProcess(_) => Some(AppServerPath::from_app_server(
+                local_codex_home.display().to_string(),
+            )),
+            Self::Remote(client) => client.codex_home().map(AppServerPath::from_app_server),
+        }
+    }
+
     pub async fn request(&self, request: ClientRequest) -> IoResult<RequestResult> {
         match self {
             Self::InProcess(client) => client.request(request).await,
@@ -771,10 +776,9 @@ impl AppServerClient {
     where
         T: DeserializeOwned,
     {
-        match self {
-            Self::InProcess(client) => client.request_typed(request).await,
-            Self::Remote(client) => client.request_typed(request).await,
-        }
+        let method = request.method_name();
+        let response = self.request(request).await;
+        decode_typed_response(method, response)
     }
 
     pub async fn notify(&self, notification: ClientNotification) -> IoResult<()> {
@@ -828,22 +832,10 @@ impl AppServerClient {
     }
 }
 
-/// Extracts the JSON-RPC method name for diagnostics without extending the
-/// protocol crate with in-process-only helpers.
-pub(crate) fn request_method_name(request: &ClientRequest) -> String {
-    serde_json::to_value(request)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("method")
-                .and_then(serde_json::Value::as_str)
-                .map(ToOwned::to_owned)
-        })
-        .unwrap_or_else(|| "<unknown>".to_string())
-}
-
 #[cfg(test)]
 mod tests {
+    #[path = "reply_tests.rs"]
+    mod replies;
     use super::*;
     use codex_app_server_protocol::AccountUpdatedNotification;
     use codex_app_server_protocol::ConfigRequirementsReadResponse;
@@ -853,59 +845,136 @@ mod tests {
     use codex_app_server_protocol::JSONRPCResponse;
     use codex_app_server_protocol::ServerNotification;
     use codex_app_server_protocol::SessionSource as ApiSessionSource;
+    use codex_app_server_protocol::ThreadSettingsUpdateParams;
+    use codex_app_server_protocol::ThreadSettingsUpdateResponse;
     use codex_app_server_protocol::ThreadStartParams;
     use codex_app_server_protocol::ThreadStartResponse;
     use codex_app_server_protocol::ToolRequestUserInputParams;
     use codex_app_server_protocol::ToolRequestUserInputQuestion;
-    use codex_core::AuthManager;
-    use codex_core::ThreadManager;
     use codex_core::config::ConfigBuilder;
+    use codex_core::init_state_db;
+    use codex_protocol::config_types::Personality;
+    use codex_uds::UnixListener;
+    use codex_utils_absolute_path::AbsolutePathBuf;
     use futures::SinkExt;
     use futures::StreamExt;
+    use futures::poll;
     use pretty_assertions::assert_eq;
+    use std::ops::Deref;
+    use std::path::Path;
+    use tempfile::TempDir;
     use tokio::net::TcpListener;
     use tokio::time::Duration;
     use tokio::time::timeout;
     use tokio_tungstenite::accept_async;
+    use tokio_tungstenite::accept_hdr_async;
     use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::handshake::server::Request as WebSocketRequest;
+    use tokio_tungstenite::tungstenite::handshake::server::Response as WebSocketResponse;
+    use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 
     async fn build_test_config() -> Config {
         match ConfigBuilder::default().build().await {
             Ok(config) => config,
             Err(_) => Config::load_default_with_cli_overrides(Vec::new())
+                .await
                 .expect("default config should load"),
+        }
+    }
+
+    async fn build_test_config_for_codex_home(codex_home: &Path) -> Config {
+        match ConfigBuilder::default()
+            .codex_home(codex_home.to_path_buf())
+            .build()
+            .await
+        {
+            Ok(config) => config,
+            Err(_) => Config::load_default_with_cli_overrides_for_codex_home(
+                codex_home.to_path_buf(),
+                Vec::new(),
+            )
+            .await
+            .expect("default config should load"),
+        }
+    }
+
+    struct TestClient {
+        _codex_home: TempDir,
+        client: InProcessAppServerClient,
+    }
+
+    impl Deref for TestClient {
+        type Target = InProcessAppServerClient;
+
+        fn deref(&self) -> &Self::Target {
+            &self.client
+        }
+    }
+
+    impl TestClient {
+        async fn shutdown(self) -> IoResult<()> {
+            self.client.shutdown().await
         }
     }
 
     async fn start_test_client_with_capacity(
         session_source: SessionSource,
         channel_capacity: usize,
-    ) -> InProcessAppServerClient {
-        InProcessAppServerClient::start(InProcessClientStartArgs {
+    ) -> TestClient {
+        let codex_home = TempDir::new().expect("temp dir");
+        let config = Arc::new(build_test_config_for_codex_home(codex_home.path()).await);
+        let state_db = init_state_db(config.as_ref())
+            .await
+            .expect("state db should initialize for in-process test");
+        let client = InProcessAppServerClient::start(InProcessClientStartArgs {
             arg0_paths: Arg0DispatchPaths::default(),
-            config: Arc::new(build_test_config().await),
+            config,
             cli_overrides: Vec::new(),
             loader_overrides: LoaderOverrides::default(),
-            cloud_requirements: CloudRequirementsLoader::default(),
+            strict_config: false,
+            cloud_config_bundle: CloudConfigBundleLoader::default(),
+            embedded_network_policy: Default::default(),
             feedback: CodexFeedback::new(),
+            log_db: None,
+            state_db: Some(state_db),
+            environment_manager: Arc::new(EnvironmentManager::default_for_tests()),
             config_warnings: Vec::new(),
             session_source,
             enable_codex_api_key_env: false,
             client_name: "codex-app-server-client-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity,
         })
         .await
-        .expect("in-process app-server client should start")
+        .expect("in-process app-server client should start");
+
+        TestClient {
+            _codex_home: codex_home,
+            client,
+        }
     }
 
-    async fn start_test_client(session_source: SessionSource) -> InProcessAppServerClient {
+    async fn start_test_client(session_source: SessionSource) -> TestClient {
         start_test_client_with_capacity(session_source, DEFAULT_IN_PROCESS_CHANNEL_CAPACITY).await
     }
 
     async fn start_test_remote_server<F, Fut>(handler: F) -> String
+    where
+        F: FnOnce(tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) -> Fut
+            + Send
+            + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        start_test_remote_server_with_auth(/*expected_auth_token*/ None, handler).await
+    }
+
+    async fn start_test_remote_server_with_auth<F, Fut>(
+        expected_auth_token: Option<String>,
+        handler: F,
+    ) -> String
     where
         F: FnOnce(tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) -> Fut
             + Send
@@ -918,17 +987,48 @@ mod tests {
         let addr = listener.local_addr().expect("listener address");
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept should succeed");
-            let websocket = accept_async(stream)
-                .await
-                .expect("websocket upgrade should succeed");
+            let websocket = accept_hdr_async(
+                stream,
+                move |request: &WebSocketRequest, response: WebSocketResponse| {
+                    let provided_auth_token = request
+                        .headers()
+                        .get(AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned);
+                    let expected_auth_token = expected_auth_token
+                        .as_ref()
+                        .map(|token| format!("Bearer {token}"));
+                    assert_eq!(provided_auth_token, expected_auth_token);
+                    Ok(response)
+                },
+            )
+            .await
+            .expect("websocket upgrade should succeed");
             handler(websocket).await;
         });
         format!("ws://{addr}")
     }
 
-    async fn expect_remote_initialize(
-        websocket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
-    ) {
+    async fn expect_remote_initialize<S>(websocket: &mut tokio_tungstenite::WebSocketStream<S>)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        expect_remote_initialize_with_metadata(
+            websocket,
+            serde_json::json!({
+                "userAgent": "codex_cli_rs/9.8.7-test (Test OS; x86_64) rust",
+                "codexHome": "/server/.codex",
+            }),
+        )
+        .await;
+    }
+
+    async fn expect_remote_initialize_with_metadata<S>(
+        websocket: &mut tokio_tungstenite::WebSocketStream<S>,
+        metadata: serde_json::Value,
+    ) where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
         let JSONRPCMessage::Request(request) = read_websocket_message(websocket).await else {
             panic!("expected initialize request");
         };
@@ -937,7 +1037,7 @@ mod tests {
             websocket,
             JSONRPCMessage::Response(JSONRPCResponse {
                 id: request.id,
-                result: serde_json::json!({}),
+                result: metadata,
             }),
         )
         .await;
@@ -949,9 +1049,12 @@ mod tests {
         assert_eq!(notification.method, "initialized");
     }
 
-    async fn read_websocket_message(
-        websocket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
-    ) -> JSONRPCMessage {
+    async fn read_websocket_message<S>(
+        websocket: &mut tokio_tungstenite::WebSocketStream<S>,
+    ) -> JSONRPCMessage
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
         loop {
             let frame = websocket
                 .next()
@@ -971,10 +1074,12 @@ mod tests {
         }
     }
 
-    async fn write_websocket_message(
-        websocket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    async fn write_websocket_message<S>(
+        websocket: &mut tokio_tungstenite::WebSocketStream<S>,
         message: JSONRPCMessage,
-    ) {
+    ) where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
         websocket
             .send(Message::Text(
                 serde_json::to_string(&message)
@@ -985,20 +1090,136 @@ mod tests {
             .expect("message should send");
     }
 
+    fn command_execution_output_delta_notification(delta: &str) -> ServerNotification {
+        ServerNotification::CommandExecutionOutputDelta(
+            codex_app_server_protocol::CommandExecutionOutputDeltaNotification {
+                thread_id: "thread".to_string(),
+                turn_id: "turn".to_string(),
+                item_id: "item".to_string(),
+                delta: delta.to_string(),
+            },
+        )
+    }
+
+    fn agent_message_delta_notification(delta: &str) -> ServerNotification {
+        ServerNotification::AgentMessageDelta(
+            codex_app_server_protocol::AgentMessageDeltaNotification {
+                thread_id: "thread".to_string(),
+                turn_id: "turn".to_string(),
+                item_id: "item".to_string(),
+                delta: delta.to_string(),
+            },
+        )
+    }
+
+    fn item_completed_notification(text: &str) -> ServerNotification {
+        ServerNotification::ItemCompleted(codex_app_server_protocol::ItemCompletedNotification {
+            thread_id: "thread".to_string(),
+            turn_id: "turn".to_string(),
+            completed_at_ms: 0,
+            item: codex_app_server_protocol::ThreadItem::AgentMessage {
+                id: "item".to_string(),
+                text: text.to_string(),
+                phase: None,
+                memory_citation: None,
+                delivery: None,
+                questions: None,
+            },
+        })
+    }
+
+    fn turn_completed_notification() -> ServerNotification {
+        ServerNotification::TurnCompleted(codex_app_server_protocol::TurnCompletedNotification {
+            thread_id: "thread".to_string(),
+            turn: codex_app_server_protocol::Turn {
+                id: "turn".to_string(),
+                root_turn_id: None,
+                items_view: codex_app_server_protocol::TurnItemsView::Full,
+                items: Vec::new(),
+                status: codex_app_server_protocol::TurnStatus::Completed,
+                error: None,
+                started_at: None,
+                completed_at: Some(0),
+                duration_ms: Some(1),
+            },
+        })
+    }
+
     fn test_remote_connect_args(websocket_url: String) -> RemoteAppServerConnectArgs {
         RemoteAppServerConnectArgs {
-            websocket_url,
+            endpoint: RemoteAppServerEndpoint::WebSocket {
+                websocket_url,
+                auth_token: None,
+            },
             client_name: "codex-app-server-client-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         }
     }
 
+    #[test]
+    fn remote_initialize_params_forward_openai_form_capability() {
+        let mut args = test_remote_connect_args("ws://localhost/rpc".to_string());
+        args.mcp_server_openai_form_elicitation = true;
+
+        assert!(
+            args.initialize_params()
+                .capabilities
+                .expect("initialize capabilities")
+                .mcp_server_openai_form_elicitation
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_request_drop_cancels_waiting_send_and_reply() {
+        let (command_tx, mut commands) = mpsc::channel(/*buffer*/ 1);
+        let handle =
+            AppServerRequestHandle::InProcess(InProcessAppServerRequestHandle { command_tx });
+        let request = ClientRequest::ConfigRequirementsRead {
+            request_id: RequestId::String("typed-request".to_string()),
+            params: None,
+        };
+        let mut pending = Box::pin(handle.request_typed::<serde_json::Value>(request.clone()));
+        assert!(matches!(
+            commands.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(poll!(&mut pending).is_pending());
+        let mut blocked = Box::pin(handle.request_typed::<serde_json::Value>(request.clone()));
+        assert!(poll!(&mut blocked).is_pending());
+        drop(blocked);
+
+        let ClientCommand::Request {
+            request: sent,
+            response_tx,
+        } = commands.try_recv().expect("first request should be queued")
+        else {
+            panic!("expected request command");
+        };
+        assert_eq!(*sent, request);
+        assert!(!response_tx.is_closed());
+        drop(pending);
+        assert!(response_tx.is_closed());
+        assert!(matches!(
+            commands.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
     #[tokio::test]
     async fn typed_request_roundtrip_works() {
-        let client = start_test_client(SessionSource::Exec).await;
+        let TestClient {
+            _codex_home,
+            client,
+        } = start_test_client(SessionSource::Exec).await;
+        let client = AppServerClient::InProcess(client);
+        assert_eq!(
+            (client.platform_family(), client.platform_os()),
+            (Some(std::env::consts::FAMILY), Some(std::env::consts::OS))
+        );
         let _response: ConfigRequirementsReadResponse = client
             .request_typed(ClientRequest::ConfigRequirementsRead {
                 request_id: RequestId::Integer(1),
@@ -1052,7 +1273,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shared_thread_manager_tracks_threads_started_via_app_server() {
+    async fn threads_started_via_app_server_are_visible_through_typed_requests() {
         let client = start_test_client(SessionSource::Cli).await;
 
         let response: ThreadStartResponse = client
@@ -1065,24 +1286,27 @@ mod tests {
             })
             .await
             .expect("thread/start should succeed");
-        let created_thread_id = codex_protocol::ThreadId::from_string(&response.thread.id)
-            .expect("thread id should parse");
-        timeout(
-            Duration::from_secs(2),
-            client.thread_manager().get_thread(created_thread_id),
-        )
-        .await
-        .expect("timed out waiting for retained thread manager to observe started thread")
-        .expect("started thread should be visible through the shared thread manager");
-        let thread_ids = client.thread_manager().list_thread_ids().await;
-        assert!(thread_ids.contains(&created_thread_id));
+        let read = client
+            .request_typed::<codex_app_server_protocol::ThreadReadResponse>(
+                ClientRequest::ThreadRead {
+                    request_id: RequestId::Integer(4),
+                    params: codex_app_server_protocol::ThreadReadParams {
+                        thread_id: response.thread.id.clone(),
+                        include_turns: false,
+                    },
+                },
+            )
+            .await
+            .expect("thread/read should return the newly started thread");
+        assert_eq!(read.thread.id, response.thread.id);
 
         client.shutdown().await.expect("shutdown should complete");
     }
 
     #[tokio::test]
     async fn tiny_channel_capacity_still_supports_request_roundtrip() {
-        let client = start_test_client_with_capacity(SessionSource::Exec, 1).await;
+        let client =
+            start_test_client_with_capacity(SessionSource::Exec, /*channel_capacity*/ 1).await;
         let _response: ConfigRequirementsReadResponse = client
             .request_typed(ClientRequest::ConfigRequirementsRead {
                 request_id: RequestId::Integer(1),
@@ -1091,6 +1315,119 @@ mod tests {
             .await
             .expect("typed request should succeed");
         client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn unread_lossless_notifications_do_not_block_in_process_requests() {
+        let mut client =
+            start_test_client_with_capacity(SessionSource::Cli, /*channel_capacity*/ 1).await;
+        let thread: ThreadStartResponse = client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(1),
+                params: ThreadStartParams {
+                    ephemeral: Some(true),
+                    personality: Some(Personality::None),
+                    ..ThreadStartParams::default()
+                },
+            })
+            .await
+            .expect("thread/start should succeed");
+        let request_handle = client.request_handle();
+
+        timeout(Duration::from_secs(2), async {
+            for (index, personality) in [
+                Personality::Friendly,
+                Personality::Pragmatic,
+                Personality::Friendly,
+                Personality::Pragmatic,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let _: ThreadSettingsUpdateResponse = request_handle
+                    .request_typed(ClientRequest::ThreadSettingsUpdate {
+                        request_id: RequestId::Integer((index + 2) as i64),
+                        params: ThreadSettingsUpdateParams {
+                            thread_id: thread.thread.id.clone(),
+                            personality: Some(personality),
+                            ..ThreadSettingsUpdateParams::default()
+                        },
+                    })
+                    .await
+                    .expect("thread/settings/update should succeed");
+            }
+
+            let _: ConfigRequirementsReadResponse = request_handle
+                .request_typed(ClientRequest::ConfigRequirementsRead {
+                    request_id: RequestId::Integer(10),
+                    params: None,
+                })
+                .await
+                .expect("configuration request should succeed");
+        })
+        .await
+        .expect("unread lossless notifications must not block app-server requests");
+
+        let mut personalities = Vec::new();
+        timeout(Duration::from_secs(2), async {
+            while personalities.len() < 4 {
+                if let Some(InProcessServerEvent::ServerNotification(notification)) =
+                    client.client.next_event().await
+                    && let ServerNotification::ThreadSettingsUpdated(notification) =
+                        notification.as_ref()
+                {
+                    personalities.push(notification.thread_settings.personality);
+                }
+            }
+        })
+        .await
+        .expect("queued settings notifications should remain readable");
+        assert_eq!(
+            personalities,
+            vec![
+                Some(Personality::Friendly),
+                Some(Personality::Pragmatic),
+                Some(Personality::Friendly),
+                Some(Personality::Pragmatic),
+            ]
+        );
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn remote_platform_metadata_preserves_reported_and_missing_values() {
+        for (family, os) in [
+            (Some("windows"), Some("windows")),
+            (Some("unix"), Some("linux")),
+            (Some("future-family"), Some("future-os")),
+            (Some("unix"), None),
+            (None, Some("linux")),
+            (None, None),
+        ] {
+            let websocket_url = start_test_remote_server(move |mut websocket| async move {
+                let mut metadata = serde_json::json!({});
+                if let Some(family) = family {
+                    metadata["platformFamily"] = family.into();
+                }
+                if let Some(os) = os {
+                    metadata["platformOs"] = os.into();
+                }
+                expect_remote_initialize_with_metadata(&mut websocket, metadata).await;
+                websocket.close(None).await.expect("close should succeed");
+            })
+            .await;
+            let client = AppServerClient::Remote(
+                RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
+                    .await
+                    .expect("remote client should connect"),
+            );
+            assert_eq!(
+                (client.platform_family(), client.platform_os()),
+                (family, os)
+            );
+            client.shutdown().await.expect("shutdown should complete");
+        }
     }
 
     #[tokio::test]
@@ -1107,6 +1444,7 @@ mod tests {
                 JSONRPCMessage::Response(JSONRPCResponse {
                     id: request.id,
                     result: serde_json::to_value(GetAccountResponse {
+                        workspace_routing: None,
                         account: None,
                         requires_openai_auth: false,
                     })
@@ -1114,6 +1452,113 @@ mod tests {
                 }),
             )
             .await;
+            websocket.close(None).await.expect("close should succeed");
+        })
+        .await;
+        let client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
+            .await
+            .expect("remote client should connect");
+
+        assert_eq!(client.server_version(), Some("9.8.7-test"));
+        assert_eq!(client.codex_home(), Some("/server/.codex"));
+        let client = AppServerClient::Remote(client);
+        let response: GetAccountResponse = client
+            .request_typed(ClientRequest::GetAccount {
+                request_id: RequestId::Integer(1),
+                params: codex_app_server_protocol::GetAccountParams {
+                    refresh_token: false,
+                },
+            })
+            .await
+            .expect("typed request should succeed");
+        assert_eq!(response.account, None);
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn remote_unix_socket_typed_request_roundtrip_works() {
+        let socket_dir = TempDir::new().expect("socket dir");
+        let socket_path = AbsolutePathBuf::from_absolute_path(socket_dir.path().join("codex.sock"))
+            .expect("socket path should resolve");
+        let mut listener = UnixListener::bind(socket_path.as_path())
+            .await
+            .expect("listener should bind");
+        tokio::spawn(async move {
+            let stream = listener.accept().await.expect("accept should succeed");
+            let mut websocket = accept_async(stream)
+                .await
+                .expect("websocket upgrade should succeed");
+            expect_remote_initialize(&mut websocket).await;
+            let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
+            else {
+                panic!("expected account/read request");
+            };
+            assert_eq!(request.method, "account/read");
+            write_websocket_message(
+                &mut websocket,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: request.id,
+                    result: serde_json::to_value(GetAccountResponse {
+                        workspace_routing: None,
+                        account: None,
+                        requires_openai_auth: false,
+                    })
+                    .expect("response should serialize"),
+                }),
+            )
+            .await;
+            websocket.close(None).await.expect("close should succeed");
+        });
+        let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            endpoint: RemoteAppServerEndpoint::UnixSocket { socket_path },
+            client_name: "codex-app-server-client-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: 8,
+        })
+        .await
+        .expect("remote client should connect");
+
+        let response: GetAccountResponse = client
+            .request_typed(ClientRequest::GetAccount {
+                request_id: RequestId::Integer(1),
+                params: codex_app_server_protocol::GetAccountParams {
+                    refresh_token: false,
+                },
+            })
+            .await
+            .expect("typed request should succeed");
+        assert_eq!(response.account, None);
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn remote_typed_request_accepts_large_single_frame_response() {
+        let padding = "x".repeat((17 << 20) + 1024);
+        let websocket_url = start_test_remote_server(move |mut websocket| async move {
+            expect_remote_initialize(&mut websocket).await;
+            let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
+            else {
+                panic!("expected account/read request");
+            };
+            assert_eq!(request.method, "account/read");
+            write_websocket_message(
+                &mut websocket,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: request.id,
+                    result: serde_json::json!({
+                        "account": null,
+                        "requiresOpenaiAuth": false,
+                        "padding": padding,
+                    }),
+                }),
+            )
+            .await;
+            websocket.close(None).await.expect("close should succeed");
         })
         .await;
         let client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
@@ -1128,10 +1573,85 @@ mod tests {
                 },
             })
             .await
-            .expect("typed request should succeed");
-        assert_eq!(response.account, None);
+            .expect("large typed request should succeed");
+        assert_eq!(
+            response,
+            GetAccountResponse {
+                workspace_routing: None,
+                account: None,
+                requires_openai_auth: false,
+            }
+        );
 
         client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn remote_connect_includes_auth_header_when_configured() {
+        let auth_token = "remote-bearer-token".to_string();
+        let websocket_url = start_test_remote_server_with_auth(
+            Some(auth_token.clone()),
+            |mut websocket| async move {
+                expect_remote_initialize(&mut websocket).await;
+                websocket.close(None).await.expect("close should succeed");
+            },
+        )
+        .await;
+        let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            endpoint: RemoteAppServerEndpoint::WebSocket {
+                websocket_url,
+                auth_token: Some(auth_token),
+            },
+            client_name: "codex-app-server-client-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: 8,
+        })
+        .await
+        .expect("remote client should connect");
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn remote_connect_rejects_non_loopback_ws_when_auth_configured() {
+        let result = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            endpoint: RemoteAppServerEndpoint::WebSocket {
+                websocket_url: "ws://example.com:4500".to_string(),
+                auth_token: Some("remote-bearer-token".to_string()),
+            },
+            client_name: "codex-app-server-client-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: 8,
+        })
+        .await;
+        let err = match result {
+            Ok(_) => panic!("non-loopback ws should be rejected before connect"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string()
+                .contains("remote auth tokens require `wss://` or loopback `ws://` URLs")
+        );
+    }
+
+    #[test]
+    fn remote_auth_token_transport_policy_allows_wss_and_loopback_ws() {
+        assert!(crate::remote::websocket_url_supports_auth_token(
+            &url::Url::parse("wss://example.com:443").expect("wss URL should parse")
+        ));
+        assert!(crate::remote::websocket_url_supports_auth_token(
+            &url::Url::parse("ws://127.0.0.1:4500").expect("loopback ws URL should parse")
+        ));
+        assert!(!crate::remote::websocket_url_supports_auth_token(
+            &url::Url::parse("ws://example.com:4500").expect("non-loopback ws URL should parse")
+        ));
     }
 
     #[tokio::test]
@@ -1161,6 +1681,7 @@ mod tests {
                 JSONRPCMessage::Response(JSONRPCResponse {
                     id: request.id,
                     result: serde_json::to_value(GetAccountResponse {
+                        workspace_routing: None,
                         account: None,
                         requires_openai_auth: false,
                     })
@@ -1214,6 +1735,7 @@ mod tests {
         assert_eq!(
             first_response,
             GetAccountResponse {
+                workspace_routing: None,
                 account: None,
                 requires_openai_auth: false,
             }
@@ -1224,24 +1746,25 @@ mod tests {
 
     #[tokio::test]
     async fn remote_notifications_arrive_over_websocket() {
+        let (close_tx, close_rx) = tokio::sync::oneshot::channel();
         let websocket_url = start_test_remote_server(|mut websocket| async move {
             expect_remote_initialize(&mut websocket).await;
-            write_websocket_message(
-                &mut websocket,
-                JSONRPCMessage::Notification(
-                    serde_json::from_value(
-                        serde_json::to_value(ServerNotification::AccountUpdated(
-                            AccountUpdatedNotification {
-                                auth_mode: None,
-                                plan_type: None,
-                            },
-                        ))
-                        .expect("notification should serialize"),
-                    )
-                    .expect("notification should convert to JSON-RPC"),
-                ),
-            )
-            .await;
+            let notification = JSONRPCMessage::Notification(
+                serde_json::from_value(
+                    serde_json::to_value(ServerNotification::AccountUpdated(
+                        AccountUpdatedNotification {
+                            auth_mode: None,
+                            plan_type: None,
+                        },
+                    ))
+                    .expect("notification should serialize"),
+                )
+                .expect("notification should convert to JSON-RPC"),
+            );
+            // Only the first notification is consumed; the other can arrive during shutdown.
+            write_websocket_message(&mut websocket, notification.clone()).await;
+            write_websocket_message(&mut websocket, notification).await;
+            let _ = close_tx.send(websocket.next().await);
         })
         .await;
         let mut client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
@@ -1251,9 +1774,119 @@ mod tests {
         let event = client.next_event().await.expect("event should arrive");
         assert!(matches!(
             event,
-            AppServerEvent::ServerNotification(ServerNotification::AccountUpdated(_))
+            AppServerEvent::ServerNotification(notification)
+                if matches!(notification.as_ref(), ServerNotification::AccountUpdated(_))
         ));
 
+        client.shutdown().await.expect("shutdown should complete");
+        assert_eq!(
+            close_rx
+                .await
+                .expect("server should observe shutdown")
+                .expect("server should receive a frame")
+                .expect("websocket should close cleanly"),
+            Message::Close(None),
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_backpressure_preserves_transcript_notifications() {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let websocket_url = start_test_remote_server(|mut websocket| async move {
+            expect_remote_initialize(&mut websocket).await;
+            for notification in [
+                command_execution_output_delta_notification("stdout-1"),
+                command_execution_output_delta_notification("stdout-2"),
+                agent_message_delta_notification("hello"),
+                item_completed_notification("hello"),
+                turn_completed_notification(),
+            ] {
+                write_websocket_message(
+                    &mut websocket,
+                    JSONRPCMessage::Notification(
+                        serde_json::from_value(
+                            serde_json::to_value(notification)
+                                .expect("notification should serialize"),
+                        )
+                        .expect("notification should convert to JSON-RPC"),
+                    ),
+                )
+                .await;
+            }
+            let _ = done_rx.await;
+        })
+        .await;
+        let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            channel_capacity: 1,
+            ..test_remote_connect_args(websocket_url)
+        })
+        .await
+        .expect("remote client should connect");
+
+        let first_event = timeout(Duration::from_secs(2), client.next_event())
+            .await
+            .expect("first event should arrive before timeout")
+            .expect("event stream should stay open");
+        assert!(matches!(
+            first_event,
+            AppServerEvent::ServerNotification(notification)
+                if matches!(
+                    notification.as_ref(),
+                    ServerNotification::CommandExecutionOutputDelta(notification)
+                        if notification.delta == "stdout-1"
+                )
+        ));
+
+        let mut remaining_events = Vec::new();
+        for _ in 0..4 {
+            remaining_events.push(
+                timeout(Duration::from_secs(2), client.next_event())
+                    .await
+                    .expect("event should arrive before timeout")
+                    .expect("event stream should stay open"),
+            );
+        }
+
+        let mut transcript_event_names = Vec::new();
+        for event in &remaining_events {
+            match event {
+                AppServerEvent::Lagged { skipped: 1 } => {}
+                AppServerEvent::ServerNotification(notification) => match notification.as_ref() {
+                    ServerNotification::CommandExecutionOutputDelta(notification)
+                        if notification.delta == "stdout-2" => {}
+                    ServerNotification::AgentMessageDelta(notification)
+                        if notification.delta == "hello" =>
+                    {
+                        transcript_event_names.push("agent_message_delta");
+                    }
+                    ServerNotification::ItemCompleted(notification)
+                        if matches!(
+                            &notification.item,
+                            codex_app_server_protocol::ThreadItem::AgentMessage { text, .. }
+                                if text == "hello"
+                        ) =>
+                    {
+                        transcript_event_names.push("item_completed");
+                    }
+                    ServerNotification::TurnCompleted(notification)
+                        if notification.turn.status
+                            == codex_app_server_protocol::TurnStatus::Completed =>
+                    {
+                        transcript_event_names.push("turn_completed");
+                    }
+                    _ => panic!("unexpected remaining event: {event:?}"),
+                },
+                _ => panic!("unexpected remaining event: {event:?}"),
+            }
+        }
+        assert_eq!(
+            transcript_event_names,
+            vec!["agent_message_delta", "item_completed", "turn_completed"]
+        );
+
+        done_tx
+            .send(())
+            .expect("server completion signal should send");
         client.shutdown().await.expect("shutdown should complete");
     }
 
@@ -1278,6 +1911,8 @@ mod tests {
                             is_secret: false,
                             options: Some(vec![]),
                         }],
+                        is_blocking: true,
+                        auto_resolution_ms: None,
                     })
                     .expect("params should serialize"),
                 ),
@@ -1339,6 +1974,8 @@ mod tests {
                                 is_secret: false,
                                 options: Some(vec![]),
                             }],
+                            is_blocking: true,
+                            auto_resolution_ms: None,
                         })
                         .expect("params should serialize"),
                     ),
@@ -1453,11 +2090,15 @@ mod tests {
             method: "thread/read".to_string(),
             source: JSONRPCErrorError {
                 code: -32603,
-                data: None,
+                data: Some(serde_json::json!({"detail": "config lock mismatch"})),
                 message: "internal".to_string(),
             },
         };
         assert_eq!(std::error::Error::source(&server).is_some(), false);
+        assert_eq!(
+            server.to_string(),
+            "thread/read failed: internal (code -32603), data: {\"detail\":\"config lock mismatch\"}"
+        );
 
         let deserialize = TypedRequestError::Deserialize {
             method: "thread/start".to_string(),
@@ -1469,28 +2110,11 @@ mod tests {
 
     #[tokio::test]
     async fn next_event_surfaces_lagged_markers() {
-        let (command_tx, _command_rx) = mpsc::channel(1);
-        let (event_tx, event_rx) = mpsc::channel(1);
+        let (command_tx, _) = mpsc::channel(1);
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
         let worker_handle = tokio::spawn(async {});
-        let config = build_test_config().await;
-        let auth_manager = AuthManager::shared(
-            config.codex_home.clone(),
-            false,
-            config.cli_auth_credentials_store_mode,
-        );
-        let thread_manager = Arc::new(ThreadManager::new(
-            &config,
-            auth_manager.clone(),
-            SessionSource::Exec,
-            CollaborationModesConfig {
-                default_mode_request_user_input: config
-                    .features
-                    .enabled(Feature::DefaultModeRequestUserInput),
-            },
-        ));
         event_tx
             .send(InProcessServerEvent::Lagged { skipped: 3 })
-            .await
             .expect("lagged marker should enqueue");
         drop(event_tx);
 
@@ -1498,8 +2122,6 @@ mod tests {
             command_tx,
             event_rx,
             worker_handle,
-            auth_manager,
-            thread_manager,
         };
 
         let event = timeout(Duration::from_secs(2), client.next_event())
@@ -1513,59 +2135,103 @@ mod tests {
         client.shutdown().await.expect("shutdown should complete");
     }
 
-    #[test]
-    fn event_requires_delivery_marks_terminal_events() {
-        assert!(event_requires_delivery(
-            &InProcessServerEvent::ServerNotification(
-                codex_app_server_protocol::ServerNotification::TurnCompleted(
-                    codex_app_server_protocol::TurnCompletedNotification {
-                        thread_id: "thread".to_string(),
-                        turn: codex_app_server_protocol::Turn {
-                            id: "turn".to_string(),
-                            items: Vec::new(),
-                            status: codex_app_server_protocol::TurnStatus::Completed,
-                            error: None,
-                        },
-                    }
-                )
+    #[tokio::test]
+    async fn runtime_start_args_forward_environment_manager_and_openai_form_capability() {
+        let config = Arc::new(build_test_config().await);
+        let environment_manager = Arc::new(
+            EnvironmentManager::create_for_tests(
+                Some("ws://127.0.0.1:8765".to_string()),
+                Some(
+                    ExecServerRuntimeOptions::new(
+                        std::env::current_exe().expect("current exe"),
+                        /*codex_linux_sandbox_exe*/ None,
+                    )
+                    .expect("runtime paths"),
+                ),
             )
+            .await,
+        );
+
+        let runtime_args = InProcessClientStartArgs {
+            arg0_paths: Arg0DispatchPaths::default(),
+            config: config.clone(),
+            cli_overrides: Vec::new(),
+            loader_overrides: LoaderOverrides::default(),
+            strict_config: false,
+            cloud_config_bundle: CloudConfigBundleLoader::default(),
+            embedded_network_policy: Default::default(),
+            feedback: CodexFeedback::new(),
+            log_db: None,
+            state_db: None,
+            environment_manager: environment_manager.clone(),
+            config_warnings: Vec::new(),
+            session_source: SessionSource::Exec,
+            enable_codex_api_key_env: false,
+            client_name: "codex-app-server-client-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            mcp_server_openai_form_elicitation: true,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
+        }
+        .into_runtime_start_args();
+
+        assert_eq!(runtime_args.config, config);
+        assert!(
+            runtime_args
+                .initialize
+                .capabilities
+                .expect("initialize capabilities")
+                .mcp_server_openai_form_elicitation
+        );
+        assert!(Arc::ptr_eq(
+            &runtime_args.environment_manager,
+            &environment_manager
         ));
-        assert!(event_requires_delivery(
-            &InProcessServerEvent::LegacyNotification(
-                codex_app_server_protocol::JSONRPCNotification {
-                    method: "codex/event/turn_aborted".to_string(),
-                    params: None,
-                }
-            )
-        ));
-        assert!(!event_requires_delivery(&InProcessServerEvent::Lagged {
-            skipped: 1
-        }));
+        assert!(
+            runtime_args
+                .environment_manager
+                .default_environment()
+                .expect("default environment")
+                .is_remote()
+        );
     }
 
     #[tokio::test]
-    async fn accessors_expose_retained_shared_managers() {
-        let client = start_test_client(SessionSource::Cli).await;
-
-        assert!(
-            Arc::ptr_eq(&client.auth_manager(), &client.auth_manager()),
-            "auth_manager accessor should clone the retained shared manager"
-        );
-        assert!(
-            Arc::ptr_eq(&client.thread_manager(), &client.thread_manager()),
-            "thread_manager accessor should clone the retained shared manager"
-        );
-
-        client.shutdown().await.expect("shutdown should complete");
-    }
-
-    #[tokio::test]
-    async fn shutdown_completes_promptly_with_retained_shared_managers() {
+    async fn shutdown_completes_promptly_without_retained_managers() {
         let client = start_test_client(SessionSource::Cli).await;
 
         timeout(Duration::from_secs(1), client.shutdown())
             .await
             .expect("shutdown should not wait for the 5s fallback timeout")
             .expect("shutdown should complete");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_waits_for_in_process_drain() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::Ordering;
+
+        let (command_tx, mut command_rx) = mpsc::channel(1);
+        let (_event_tx, event_rx) = mpsc::unbounded_channel();
+        let completed = Arc::new(AtomicBool::new(false));
+        let worker_completed = Arc::clone(&completed);
+        let worker_handle = tokio::spawn(async move {
+            let response_tx = match command_rx.recv().await {
+                Some(ClientCommand::Shutdown { response_tx }) => response_tx,
+                _ => panic!("expected shutdown command"),
+            };
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            worker_completed.store(true, Ordering::Release);
+            let _ = response_tx.send(Ok(()));
+        });
+        let client = InProcessAppServerClient {
+            command_tx,
+            event_rx,
+            worker_handle,
+        };
+
+        client.shutdown().await.expect("shutdown should complete");
+        assert!(completed.load(Ordering::Acquire));
     }
 }

@@ -1,11 +1,57 @@
+mod interface;
+mod invocation;
+mod loading;
+mod mentions;
+mod metadata;
+mod model;
+mod name_counts;
+mod parser;
+mod selection;
+
+pub use interface::SkillInterfaceAssetPolicy;
+pub use interface::SkillInterfaceFile;
+pub use interface::resolve_skill_interface;
+pub use invocation::ImplicitSkillAccess;
+pub use invocation::ImplicitSkillLookup;
+pub use invocation::detect_implicit_skill_invocation_for_command;
+pub use invocation::implicit_skill_accesses_for_command;
+pub use loading::LoadedSkillRoot;
+pub use loading::LoadedSkills;
+pub use loading::SkillError;
+pub use loading::SkillLoadFuture;
+pub use loading::SkillRootLoadRequest;
+pub use loading::SkillRootLoader;
+pub use loading::SkillRootSnapshotCache;
+pub use loading::SkillRootSnapshots;
+pub use mentions::ToolMentionKind;
+pub use mentions::ToolMentions;
+pub use mentions::app_id_from_path;
+pub use mentions::extract_tool_mentions;
+pub use mentions::extract_tool_mentions_with_sigil;
+pub use mentions::normalize_skill_path;
+pub use mentions::plugin_config_name_from_path;
+pub use mentions::tool_kind_for_path;
+pub use metadata::ParsedSkillMetadata;
+pub use metadata::parse_skill_metadata;
+pub use model::EnvironmentSkillMetadata;
+pub use model::SkillDependencies;
+pub use model::SkillInterface;
+pub use model::SkillMetadata;
+pub use model::SkillPolicy;
+pub use model::SkillToolDependency;
+pub use name_counts::build_skill_name_counts;
+pub use parser::ParsedSkillFrontmatter;
+pub use parser::SkillParseError;
+pub use parser::parse_skill_frontmatter_metadata;
+pub use selection::ExplicitSkillLookup;
+pub use selection::collect_explicit_skill_mentions;
+
 use codex_utils_absolute_path::AbsolutePathBuf;
 use include_dir::Dir;
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::Hash;
 use std::hash::Hasher;
-use std::path::Path;
-use std::path::PathBuf;
 
 use thiserror::Error;
 
@@ -16,23 +62,10 @@ const SKILLS_DIR_NAME: &str = "skills";
 const SYSTEM_SKILLS_MARKER_FILENAME: &str = ".codex-system-skills.marker";
 const SYSTEM_SKILLS_MARKER_SALT: &str = "v1";
 
-/// Returns the on-disk cache location for embedded system skills.
-///
-/// This is typically located at `CODEX_HOME/skills/.system`.
-pub fn system_cache_root_dir(codex_home: &Path) -> PathBuf {
-    AbsolutePathBuf::try_from(codex_home)
-        .and_then(|codex_home| system_cache_root_dir_abs(&codex_home))
-        .map(AbsolutePathBuf::into_path_buf)
-        .unwrap_or_else(|_| {
-            codex_home
-                .join(SKILLS_DIR_NAME)
-                .join(SYSTEM_SKILLS_DIR_NAME)
-        })
-}
-
-fn system_cache_root_dir_abs(codex_home: &AbsolutePathBuf) -> std::io::Result<AbsolutePathBuf> {
+/// Returns the on-disk cache location for embedded system skills from an absolute CODEX_HOME.
+pub fn system_cache_root_dir(codex_home: &AbsolutePathBuf) -> AbsolutePathBuf {
     codex_home
-        .join(SKILLS_DIR_NAME)?
+        .join(SKILLS_DIR_NAME)
         .join(SYSTEM_SKILLS_DIR_NAME)
 }
 
@@ -44,21 +77,14 @@ fn system_cache_root_dir_abs(codex_home: &AbsolutePathBuf) -> std::io::Result<Ab
 /// To avoid doing unnecessary work on every startup, a marker file is written
 /// with a fingerprint of the embedded directory. When the marker matches, the
 /// install is skipped.
-pub fn install_system_skills(codex_home: &Path) -> Result<(), SystemSkillsError> {
-    let codex_home = AbsolutePathBuf::try_from(codex_home)
-        .map_err(|source| SystemSkillsError::io("normalize codex home dir", source))?;
-    let skills_root_dir = codex_home
-        .join(SKILLS_DIR_NAME)
-        .map_err(|source| SystemSkillsError::io("resolve skills root dir", source))?;
+pub fn install_system_skills(codex_home: &AbsolutePathBuf) -> Result<(), SystemSkillsError> {
+    let skills_root_dir = codex_home.join(SKILLS_DIR_NAME);
     fs::create_dir_all(skills_root_dir.as_path())
         .map_err(|source| SystemSkillsError::io("create skills root dir", source))?;
 
-    let dest_system = system_cache_root_dir_abs(&codex_home)
-        .map_err(|source| SystemSkillsError::io("resolve system skills cache root dir", source))?;
+    let dest_system = system_cache_root_dir(codex_home);
 
-    let marker_path = dest_system
-        .join(SYSTEM_SKILLS_MARKER_FILENAME)
-        .map_err(|source| SystemSkillsError::io("resolve system skills marker path", source))?;
+    let marker_path = dest_system.join(SYSTEM_SKILLS_MARKER_FILENAME);
     let expected_fingerprint = embedded_system_skills_fingerprint();
     if dest_system.as_path().is_dir()
         && read_marker(&marker_path).is_ok_and(|marker| marker == expected_fingerprint)
@@ -127,18 +153,14 @@ fn write_embedded_dir(dir: &Dir<'_>, dest: &AbsolutePathBuf) -> Result<(), Syste
     for entry in dir.entries() {
         match entry {
             include_dir::DirEntry::Dir(subdir) => {
-                let subdir_dest = dest.join(subdir.path()).map_err(|source| {
-                    SystemSkillsError::io("resolve system skills subdir", source)
-                })?;
+                let subdir_dest = dest.join(subdir.path());
                 fs::create_dir_all(subdir_dest.as_path()).map_err(|source| {
                     SystemSkillsError::io("create system skills subdir", source)
                 })?;
                 write_embedded_dir(subdir, dest)?;
             }
             include_dir::DirEntry::File(file) => {
-                let path = dest.join(file.path()).map_err(|source| {
-                    SystemSkillsError::io("resolve system skills file", source)
-                })?;
+                let path = dest.join(file.path());
                 if let Some(parent) = path.as_path().parent() {
                     fs::create_dir_all(parent).map_err(|source| {
                         SystemSkillsError::io("create system skills file parent", source)

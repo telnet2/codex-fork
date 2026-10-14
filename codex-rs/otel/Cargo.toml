@@ -12,19 +12,15 @@ path = "src/lib.rs"
 [lints]
 workspace = true
 
-[features]
-## Disables the built-in default metrics exporter.
-##
-## Intended for use from `dev-dependencies` so unit/integration tests never
-## attempt to export metrics over the network.
-disable-default-metrics-exporter = []
-
 [dependencies]
+bytes = { workspace = true }
+codex-http-client = { workspace = true }
+opentelemetry-http = "0.31.0"
 chrono = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
+codex-utils-stream-parser = { workspace = true }
 codex-utils-string = { workspace = true }
 codex-api = { workspace = true }
-codex-app-server-protocol = { workspace = true }
 codex-protocol = { workspace = true }
 eventsource-stream = { workspace = true }
 gethostname = { workspace = true }
@@ -71,3 +67,9 @@ opentelemetry_sdk = { workspace = true, features = [
     "testing",
 ] }
 pretty_assertions = { workspace = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+seccompiler = { workspace = true }

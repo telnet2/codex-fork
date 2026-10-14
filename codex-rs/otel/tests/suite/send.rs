@@ -3,7 +3,15 @@ use crate::harness::build_metrics_with_defaults;
 use crate::harness::find_metric;
 use crate::harness::histogram_data;
 use crate::harness::latest_metrics;
-use codex_otel::metrics::Result;
+use codex_otel::Result;
+use codex_otel::THREAD_SKILLS_COUNT_METRIC_BUCKETS;
+use codex_otel::THREAD_SKILLS_DESCRIPTION_TRUNCATED_CHARS_BUCKETS;
+use codex_otel::THREAD_SKILLS_DESCRIPTION_TRUNCATED_CHARS_METRIC;
+use codex_otel::THREAD_SKILLS_ENABLED_TOTAL_METRIC;
+use codex_otel::THREAD_SKILLS_TRUNCATED_BUCKETS;
+use codex_otel::THREAD_SKILLS_TRUNCATED_METRIC;
+use codex_otel::THREAD_TOOLS_FRAGMENT_BYTES_METRIC;
+use codex_otel::THREAD_TOOLS_METRIC_BUCKETS;
 use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
 
@@ -13,13 +21,29 @@ fn send_builds_payload_with_tags_and_histograms() -> Result<()> {
     let (metrics, exporter) =
         build_metrics_with_defaults(&[("service", "codex-cli"), ("env", "prod")])?;
 
-    metrics.counter("codex.turns", 1, &[("model", "gpt-5.1"), ("env", "dev")])?;
-    metrics.histogram("codex.tool_latency", 25, &[("tool", "shell")])?;
+    metrics.counter_with_description(
+        "codex.turns",
+        "Total number of Codex turns.",
+        /*inc*/ 1,
+        &[("model", "gpt-5.1"), ("env", "dev")],
+    )?;
+    metrics.histogram(
+        "codex.tool_latency",
+        /*value*/ 25,
+        &[("tool", "shell")],
+    )?;
+    metrics.gauge_with_description(
+        "codex.active",
+        "Number of active Codex operations.",
+        /*value*/ 2,
+        &[("component", "test")],
+    )?;
     metrics.shutdown()?;
 
     let resource_metrics = latest_metrics(&exporter);
 
     let counter = find_metric(&resource_metrics, "codex.turns").expect("counter metric missing");
+    assert_eq!(counter.description(), "Total number of Codex turns.");
     let counter_attributes = match counter.data() {
         opentelemetry_sdk::metrics::data::AggregatedMetrics::U64(data) => match data {
             opentelemetry_sdk::metrics::data::MetricData::Sum(sum) => {
@@ -48,8 +72,8 @@ fn send_builds_payload_with_tags_and_histograms() -> Result<()> {
     assert_eq!(count, 1);
 
     let histogram_attrs = attributes_to_map(
-        match find_metric(&resource_metrics, "codex.tool_latency").and_then(|metric| {
-            match metric.data() {
+        find_metric(&resource_metrics, "codex.tool_latency")
+            .and_then(|metric| match metric.data() {
                 opentelemetry_sdk::metrics::data::AggregatedMetrics::F64(
                     opentelemetry_sdk::metrics::data::MetricData::Histogram(histogram),
                 ) => histogram
@@ -57,11 +81,8 @@ fn send_builds_payload_with_tags_and_histograms() -> Result<()> {
                     .next()
                     .map(opentelemetry_sdk::metrics::data::HistogramDataPoint::attributes),
                 _ => None,
-            }
-        }) {
-            Some(attrs) => attrs,
-            None => panic!("histogram attributes missing"),
-        },
+            })
+            .expect("codex.tool_latency histogram attributes should exist"),
     );
     let expected_histogram_attributes = BTreeMap::from([
         ("service".to_string(), "codex-cli".to_string()),
@@ -69,6 +90,103 @@ fn send_builds_payload_with_tags_and_histograms() -> Result<()> {
         ("tool".to_string(), "shell".to_string()),
     ]);
     assert_eq!(histogram_attrs, expected_histogram_attributes);
+
+    let gauge = find_metric(&resource_metrics, "codex.active").expect("gauge metric missing");
+    assert_eq!(gauge.description(), "Number of active Codex operations.");
+    let gauge_point = match gauge.data() {
+        opentelemetry_sdk::metrics::data::AggregatedMetrics::I64(data) => match data {
+            opentelemetry_sdk::metrics::data::MetricData::Gauge(gauge) => {
+                gauge.data_points().next().expect("gauge point")
+            }
+            _ => panic!("unexpected gauge aggregation"),
+        },
+        _ => panic!("unexpected gauge metric data type"),
+    };
+    assert_eq!(gauge_point.value(), 2);
+    assert_eq!(
+        attributes_to_map(gauge_point.attributes()),
+        BTreeMap::from([
+            ("component".to_string(), "test".to_string()),
+            ("env".to_string(), "prod".to_string()),
+            ("service".to_string(), "codex-cli".to_string()),
+        ])
+    );
+
+    Ok(())
+}
+
+#[test]
+fn histogram_uses_explicit_bucket_boundaries() -> Result<()> {
+    let (metrics, exporter) = build_metrics_with_defaults(&[])?;
+
+    metrics.histogram_with_boundaries(
+        "codex.payload_bytes",
+        /*value*/ 1024,
+        &[256.0, 1024.0, 4096.0],
+        &[],
+    )?;
+    metrics.shutdown()?;
+
+    assert_eq!(
+        histogram_data(&latest_metrics(&exporter), "codex.payload_bytes"),
+        (vec![256.0, 1024.0, 4096.0], vec![0, 1, 0, 0], 1024.0, 1)
+    );
+
+    Ok(())
+}
+
+#[test]
+fn context_histograms_preserve_zero_and_family_ranges() -> Result<()> {
+    let (metrics, exporter) = build_metrics_with_defaults(&[])?;
+    let cases = [
+        (
+            THREAD_TOOLS_FRAGMENT_BYTES_METRIC,
+            THREAD_TOOLS_METRIC_BUCKETS.as_slice(),
+            32_768_i64,
+            512,
+        ),
+        (
+            THREAD_SKILLS_ENABLED_TOTAL_METRIC,
+            THREAD_SKILLS_COUNT_METRIC_BUCKETS.as_slice(),
+            512,
+            514,
+        ),
+        (
+            THREAD_SKILLS_DESCRIPTION_TRUNCATED_CHARS_METRIC,
+            THREAD_SKILLS_DESCRIPTION_TRUNCATED_CHARS_BUCKETS.as_slice(),
+            131_072,
+            512,
+        ),
+        (
+            THREAD_SKILLS_TRUNCATED_METRIC,
+            THREAD_SKILLS_TRUNCATED_BUCKETS,
+            1,
+            3,
+        ),
+    ];
+    for (name, boundaries, maximum, _) in cases {
+        for value in [0, 1, maximum, maximum + 1] {
+            metrics.histogram_with_boundaries(name, value, boundaries, &[])?;
+        }
+    }
+    metrics.shutdown()?;
+
+    let resource_metrics = latest_metrics(&exporter);
+    for (name, expected_bounds, maximum, bucket_count) in cases {
+        let (bounds, counts, sum, count) = histogram_data(&resource_metrics, name);
+        assert_eq!(bounds.as_slice(), expected_bounds);
+        assert_eq!(bounds.len(), bucket_count - 1);
+        assert_eq!(bounds[0], 0.0);
+        assert_eq!(bounds[1], 1.0);
+        assert_eq!(bounds[bucket_count - 2], maximum as f64);
+        assert!(bounds.windows(/*size*/ 2).all(|pair| pair[0] < pair[1]));
+        let mut expected_counts = vec![0; bucket_count];
+        for index in [0, 1, bucket_count - 2, bucket_count - 1] {
+            expected_counts[index] += 1;
+        }
+        assert_eq!(counts, expected_counts);
+        assert_eq!((sum, count), ((2 * maximum + 2) as f64, 4));
+    }
 
     Ok(())
 }
@@ -82,10 +200,14 @@ fn send_merges_default_tags_per_line() -> Result<()> {
         ("region", "us"),
     ])?;
 
-    metrics.counter("codex.alpha", 1, &[("env", "dev"), ("component", "alpha")])?;
+    metrics.counter(
+        "codex.alpha",
+        /*inc*/ 1,
+        &[("env", "dev"), ("component", "alpha")],
+    )?;
     metrics.counter(
         "codex.beta",
-        2,
+        /*inc*/ 2,
         &[("service", "worker"), ("component", "beta")],
     )?;
     metrics.shutdown()?;
@@ -145,7 +267,7 @@ fn send_merges_default_tags_per_line() -> Result<()> {
 fn client_sends_enqueued_metric() -> Result<()> {
     let (metrics, exporter) = build_metrics_with_defaults(&[])?;
 
-    metrics.counter("codex.turns", 1, &[("model", "gpt-5.1")])?;
+    metrics.counter("codex.turns", /*inc*/ 1, &[("model", "gpt-5.1")])?;
     metrics.shutdown()?;
 
     let resource_metrics = latest_metrics(&exporter);
@@ -173,7 +295,7 @@ fn client_sends_enqueued_metric() -> Result<()> {
 fn shutdown_flushes_in_memory_exporter() -> Result<()> {
     let (metrics, exporter) = build_metrics_with_defaults(&[])?;
 
-    metrics.counter("codex.turns", 1, &[])?;
+    metrics.counter("codex.turns", /*inc*/ 1, &[])?;
     metrics.shutdown()?;
 
     let resource_metrics = latest_metrics(&exporter);

@@ -1,55 +1,46 @@
 mod discoverable;
 mod injection;
-mod manager;
-mod manifest;
-mod marketplace;
-mod remote;
+mod mentions;
+pub(crate) mod metrics;
 mod render;
-mod startup_sync;
-mod store;
+#[cfg(test)]
+#[path = "skill_snapshot_tests.rs"]
+mod skill_snapshot_tests;
 #[cfg(test)]
 pub(crate) mod test_support;
-mod toggles;
+
+use crate::config::Config;
+use codex_core_plugins::PluginsManager;
+use codex_login::AuthManager;
+use codex_skills_extension::HostSkillsService;
+use std::sync::Arc;
+
+pub(crate) use codex_plugin::PluginCapabilitySummary;
 
 pub(crate) use discoverable::list_tool_suggest_discoverable_plugins;
 pub(crate) use injection::build_plugin_injections;
-pub use manager::AppConnectorId;
-pub use manager::ConfiguredMarketplace;
-pub use manager::ConfiguredMarketplacePlugin;
-pub use manager::LoadedPlugin;
-pub use manager::OPENAI_CURATED_MARKETPLACE_NAME;
-pub use manager::PluginCapabilitySummary;
-pub use manager::PluginDetail;
-pub use manager::PluginInstallError;
-pub use manager::PluginInstallOutcome;
-pub use manager::PluginInstallRequest;
-pub use manager::PluginLoadOutcome;
-pub use manager::PluginReadOutcome;
-pub use manager::PluginReadRequest;
-pub use manager::PluginRemoteSyncError;
-pub use manager::PluginTelemetryMetadata;
-pub use manager::PluginUninstallError;
-pub use manager::PluginsManager;
-pub use manager::RemotePluginSyncResult;
-pub use manager::installed_plugin_telemetry_metadata;
-pub use manager::load_plugin_apps;
-pub use manager::load_plugin_mcp_servers;
-pub(crate) use manager::plugin_namespace_for_skill_path;
-pub use manager::plugin_telemetry_metadata_from_root;
-pub use manifest::PluginManifestInterface;
-pub(crate) use manifest::PluginManifestPaths;
-pub(crate) use manifest::load_plugin_manifest;
-pub use marketplace::MarketplaceError;
-pub use marketplace::MarketplacePluginAuthPolicy;
-pub use marketplace::MarketplacePluginInstallPolicy;
-pub use marketplace::MarketplacePluginPolicy;
-pub use marketplace::MarketplacePluginSource;
-pub use remote::RemotePluginFetchError;
-pub use remote::fetch_remote_featured_plugin_ids;
 pub(crate) use render::render_explicit_plugin_instructions;
-pub(crate) use render::render_plugins_section;
-pub(crate) use startup_sync::curated_plugins_repo_path;
-pub(crate) use startup_sync::read_curated_plugins_sha;
-pub(crate) use startup_sync::sync_openai_plugins_repo;
-pub use store::PluginId;
-pub use toggles::collect_plugin_enabled_candidates;
+
+pub(crate) use mentions::build_connector_slug_counts;
+pub(crate) use mentions::collect_explicit_app_ids;
+pub(crate) use mentions::collect_explicit_plugin_ids;
+pub(crate) use mentions::collect_explicit_plugin_mentions;
+pub(crate) use mentions::collect_tool_mentions_from_messages;
+
+/// Constructs a standalone plugin manager with extension-owned plugin skill loading.
+///
+/// Callers that already own a host skills service should inject that existing service instead.
+pub fn plugins_manager_for_config(
+    config: &Config,
+    auth_manager: Arc<AuthManager>,
+) -> PluginsManager {
+    let skill_root_loader = Arc::new(HostSkillsService::new(
+        config.codex_home.clone(),
+        /*bundled_skills_enabled*/ false,
+    ));
+    PluginsManager::new(
+        config.codex_home.to_path_buf(),
+        auth_manager,
+        skill_root_loader,
+    )
+}

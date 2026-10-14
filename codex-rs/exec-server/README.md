@@ -1,33 +1,187 @@
 # codex-exec-server
 
-`codex-exec-server` is a small standalone JSON-RPC server for spawning
-and controlling subprocesses through `codex-utils-pty`.
+`codex-exec-server` is the library backing `codex exec-server`, a small
+JSON-RPC server for spawning and controlling subprocesses through
+`codex-utils-pty`.
 
-This PR intentionally lands only the standalone binary, client, wire protocol,
-and docs. Exec and filesystem methods are stubbed server-side here and are
-implemented in follow-up PRs.
+It provides:
 
-It currently provides:
-
-- a standalone binary: `codex-exec-server`
+- a CLI entrypoint: `codex exec-server`
 - a Rust client: `ExecServerClient`
 - a small protocol module with shared request/response types
 
-This crate is intentionally narrow. It is not wired into the main Codex CLI or
-unified-exec in this PR; it is only the standalone transport layer.
+This crate owns the transport, protocol, and filesystem/process handlers. The
+top-level `codex` binary owns hidden helper dispatch for sandboxed
+filesystem operations and `codex-linux-sandbox`.
+
+## Command metadata
+
+Launches expose `metadata.threadId` as `CODEX_THREAD_ID` and `metadata.toolCallId`
+as `CODEX_TOOL_CALL_ID` in the initial child environment. `exec_command` supplies
+the originating execution call ID, unchanged by later input. Code-mode uses the
+nested execution call ID, not the outer cell ID.
+
+These reserved labels override inherited values, policy settings, overlays, and
+cached snapshots. Present metadata clears omitted fields; absent metadata preserves
+thread-only context and unsets the call ID. Snapshot capture and validation helpers
+keep available thread context but omit the call ID; newly captured snapshots exclude
+both ID exports.
+Call IDs are copied unchanged, including empty values; NUL-containing IDs are
+omitted. Platform process-environment size limits apply.
+
+Labels support correlation, not authorization. Shell startup, commands, and
+descendants can change or remove them; consumers must handle missing or unusable
+labels. These guarantees require an updated executor: older executors may ignore
+metadata or restore stale snapshot values.
 
 ## Transport
 
-The server speaks the shared `codex-app-server-protocol` message envelope on
-the wire.
+The server speaks the exec-specific `codex-exec-server-protocol` message
+envelope on the wire.
 
-The standalone binary supports:
+The CLI entrypoint supports:
 
 - `ws://IP:PORT` (default)
+- `--remote URL --environment-id ID [--name NAME]`
+- `forward --connect ws://HOST:PORT --remote URL --environment-id ID`
+
+## Authentication
+
+Direct WebSocket listeners support app-server's opt-in auth flags, including `--ws-auth capability-token --ws-token-sha256 HEX`, token files, and signed bearer tokens; clients send `Authorization: Bearer TOKEN` on each connection.
+Use a protected transport or TLS proxy for remote access; authentication is checked at connection time and these flags do not apply to stdio, remote registration, or forwarding.
+
+App-server clients can supply the raw token through `environment/add.authBearerToken` or `auth_bearer_token` in an `environments.toml` URL entry; omission preserves unauthenticated behavior.
+Tokens require `wss://` or a loopback destination, are redacted in diagnostics, and are reused on reconnect without automatic refresh.
+
+## Remote connections
+
+Remote mode registers the local exec-server with the environment registry,
+then reconnects to the service-provided rendezvous websocket as the environment.
+Remote communication uses the Noise relay contract; the registry and harness
+must support it.
+Forward mode uses the same registration and Noise relay, but opens an independent
+WebSocket connection to the destination exec-server for each authenticated
+harness stream. Complete message payloads pass unchanged in both directions;
+the forwarder does not parse RPCs, initialize sessions, or execute requests.
+The destination owns session IDs, processes, and session resumption.
+Disconnecting either side closes its peer and resets the remote stream. The
+existing harness reconnect flow can then resume a retained destination session.
+The forwarder does not replay requests or persist execution state, so recovery
+is limited by the destination's session and process-output retention.
+It uses the standard Codex ChatGPT sign-in state; run `codex login` first when
+remote registration needs authentication. Containerized callers that receive an
+Agent Identity JWT in `CODEX_ACCESS_TOKEN` can opt into that auth path with
+`--use-agent-identity-auth`; Codex then registers an Agent task and sends the
+derived AgentAssertion headers on the registry request.
+
+Alternatively, API users can instead use `CODEX_API_KEY`;
+Codex sends it as a bearer token on the registration request. For example:
+
+```sh
+CODEX_API_KEY="$OPENAI_API_KEY" \
+codex exec-server \
+  --remote ... \
+  --environment-id "$ENVIRONMENT_ID"
+```
+
+AWS-hosted registries can use SigV4 for registry requests and the executor
+WebSocket handshake. Select the transport and authentication with executor
+arguments rather than `config.toml` settings:
+
+```sh
+codex exec-server \
+  --remote https://example.com \
+  --environment-id "$ENVIRONMENT_ID" \
+  --remote-transport direct \
+  --aws-sigv4 \
+  --aws-profile development \
+  --aws-region us-west-2 \
+  --aws-service bedrock-mantle
+```
+
+Noise remains the default transport. Direct requires `--aws-sigv4`, which
+conflicts with `--use-agent-identity-auth` and is not supported for Noise.
+The AWS options require `--aws-sigv4`; Direct forwarding remains unsupported.
+The AWS SDK default credential and region chains are used when `--aws-profile`
+or `--aws-region` is omitted. The signing service defaults to `execute-api`.
+Direct mode registers `direct_jsonrpc_v1` through the AWS-owned
+`/cloud/environment/{environment_id}/direct/register` endpoint and carries plain
+exec-server JSON-RPC over the authenticated WebSocket. The existing Codex Noise
+registration endpoint remains unchanged. Production deployments must use TLS
+(`https`/`wss`).
+
+Direct registration URLs must remain reusable across disconnects and temporary
+connection failures. The executor only refreshes its registration when the
+WebSocket handshake returns `409 Conflict`. Handshake `408`, `429`, and `5xx`
+responses retry with backoff using the current registration; other `4xx` responses
+stop the executor. A backend that issues single-use connection URLs must adapt to
+this contract. If the initial registration or a registration refresh fails, the
+executor returns the error without retrying registration, matching Noise.
 
 Wire framing:
 
-- websocket: one JSON-RPC message per websocket text frame
+- local websocket: one JSON-RPC message per websocket message
+- direct remote websocket: one JSON-RPC message per websocket message
+- Noise remote websocket: binary protobuf relay frames carrying encrypted payloads
+
+## Remote Relay Message Format
+
+In remote mode, the harness and environment communicate through rendezvous using
+`codex.exec_server.relay.v1.RelayMessageFrame`; the checked-in schema is in
+`src/proto/codex.exec_server.relay.v1.proto`. The relay frame carries stream
+identity plus endpoint-owned reliability metadata:
+
+```text
+version
+stream_id
+traceparent       // optional W3C parent on the first frame of a traced request
+tracestate        // optional W3C vendor state paired with traceparent
+body              // handshake | data | ack_frame | resume | reset | heartbeat
+ack               // highest contiguous peer segment seq received
+ack_bits          // bitset for peer segment seqs after ack
+seq               // data only: segment sequence number
+segment_index     // data only: 0-based index within message
+segment_count     // data only: number of segments in message
+payload           // handshake bytes or encrypted data record
+next_seq          // resume only: next sender seq
+reason            // reset only: reset reason
+```
+
+`stream_id` identifies one virtual harness/environment JSON-RPC session on the
+environment websocket. The harness generates a UUIDv4 `stream_id`; the environment
+demuxes frames by `stream_id` and runs an independent `ConnectionProcessor` per
+stream.
+
+Use segment-level sequence numbers for reliability:
+
+```text
+seq = 0, 1, 2, 3, ...
+```
+
+Use contiguous segment sequence ranges to identify and stitch a segmented
+application message:
+
+```text
+message_start_seq = seq - segment_index
+segment_index = 0
+segment_count = 1
+```
+
+`message_start_seq` is derived by the receiver, not sent on the wire. For
+unsplit messages, `message_start_seq == seq`, `segment_index == 0`, and
+`segment_count == 1`.
+
+Use cumulative `ack` plus fixed-size `ack_bits` instead of variable ack ranges:
+
+```text
+ack = highest contiguous received segment seq
+bit i in ack_bits acknowledges seq = ack + 1 + i
+```
+
+Send `ack` and `ack_bits` redundantly on every outbound frame. Acks are not
+themselves acked. Acks, retries, duplicate suppression, segmentation, and
+reassembly are endpoint responsibilities; rendezvous only routes relay frames
+by `stream_id`.
 
 ## Lifecycle
 
@@ -36,7 +190,10 @@ Each connection follows this sequence:
 1. Send `initialize`.
 2. Wait for the `initialize` response.
 3. Send `initialized`.
-4. Call exec or filesystem RPCs once the follow-up implementation PRs land.
+4. Call process or filesystem RPCs.
+
+Requests run sequentially by default. Pass `--concurrent-requests <COUNT>` to
+enable concurrent processing.
 
 If the server receives any notification other than `initialized`, it replies
 with an error using request id `-1`.
@@ -61,8 +218,31 @@ Request params:
 Response:
 
 ```json
-{}
+{
+  "sessionId": "00000000-0000-4000-8000-000000000001",
+  "environmentInfo": {
+    "shell": { "name": "bash", "path": "/bin/bash" },
+    "executorVersion": "1.2.3-alpha.4",
+    "providerId": "sha256:fb4f62da3e84f6864dcec8ede7bc66f1c96ecaeaf55f8a786b85df994057c8ac",
+    "cwd": "file:///workspace"
+  }
+}
 ```
+
+`environmentInfo` contains the same executor metadata returned by
+`environment/info`, so clients can use it without a second request.
+
+`executorVersion` is the executor's package release version, or `0.0.0` when unknown.
+
+The executor caches optional `providerId` at startup using
+`codex_build_info::build_id(commit, target)`, which CI can also call for an
+explicit build target. This opaque compatibility key excludes package version
+and requires no manifest. It identifies a standard build configuration, not exact
+executable bytes. Unstamped and legacy executors may omit it.
+
+Rust clients cache this metadata for the client's lifetime, including session
+resumption. If initialization omits it, the first metadata request fetches and
+caches `environment/info`.
 
 ### `initialized`
 
@@ -72,7 +252,7 @@ Handshake acknowledgement notification sent by the client after a successful
 Params are currently ignored. Sending any other notification method is treated
 as an invalid request.
 
-### `command/exec`
+### `process/start`
 
 Starts a new managed process.
 
@@ -82,12 +262,12 @@ Request params:
 {
   "processId": "proc-1",
   "argv": ["bash", "-lc", "printf 'hello\\n'"],
-  "cwd": "/absolute/working/directory",
+  "cwd": "file:///absolute/working/directory",
   "env": {
     "PATH": "/usr/bin:/bin"
   },
   "tty": true,
-  "outputBytesCap": 16384,
+  "pipeStdin": false,
   "arg0": null
 }
 ```
@@ -96,37 +276,67 @@ Field definitions:
 
 - `processId`: caller-chosen stable id for this process within the connection.
 - `argv`: command vector. It must be non-empty.
-- `cwd`: absolute working directory used for the child process.
+- `cwd`: `file:` URI for the child process working directory.
 - `env`: environment variables passed to the child process.
-- `tty`: when `true`, spawn a PTY-backed interactive process; when `false`,
-  spawn a pipe-backed process with closed stdin.
-- `outputBytesCap`: maximum retained stdout/stderr bytes per stream for the
-  in-memory buffer. Defaults to `codex_utils_pty::DEFAULT_OUTPUT_BYTES_CAP`.
+- `tty`: when `true`, spawn a PTY-backed interactive process.
+- `pipeStdin`: when `true`, keep non-PTY stdin writable via `process/write`.
 - `arg0`: optional argv0 override forwarded to `codex-utils-pty`.
 
 Response:
 
 ```json
 {
-  "processId": "proc-1",
-  "running": true,
-  "exitCode": null,
-  "stdout": null,
-  "stderr": null
+  "processId": "proc-1"
 }
 ```
 
 Behavior notes:
 
 - Reusing an existing `processId` is rejected.
-- PTY-backed processes accept later writes through `command/exec/write`.
-- Pipe-backed processes are launched with stdin closed and reject writes.
-- Output is streamed asynchronously via `command/exec/outputDelta`.
-- Exit is reported asynchronously via `command/exec/exited`.
+- PTY-backed processes accept later writes through `process/write`.
+- Non-PTY processes reject writes unless `pipeStdin` is `true`.
+- Output is streamed asynchronously via `process/output`.
+- Exit is reported asynchronously via `process/exited`.
 
-### `command/exec/write`
+### `process/read`
 
-Writes raw bytes to a running PTY-backed process stdin.
+Reads buffered output and terminal state for a managed process.
+
+Request params:
+
+```json
+{
+  "processId": "proc-1",
+  "afterSeq": null,
+  "maxBytes": 65536,
+  "waitMs": 1000
+}
+```
+
+Field definitions:
+
+- `processId`: managed process id returned by `process/start`.
+- `afterSeq`: optional sequence number cursor; when present, only newer chunks
+  are returned.
+- `maxBytes`: optional response byte budget.
+- `waitMs`: optional long-poll timeout in milliseconds.
+
+Response:
+
+```json
+{
+  "chunks": [],
+  "nextSeq": 1,
+  "exited": false,
+  "exitCode": null,
+  "closed": false,
+  "failure": null
+}
+```
+
+### `process/write`
+
+Writes raw bytes to a running process stdin.
 
 Request params:
 
@@ -143,16 +353,16 @@ Response:
 
 ```json
 {
-  "accepted": true
+  "status": "accepted"
 }
 ```
 
 Behavior notes:
 
 - Writes to an unknown `processId` are rejected.
-- Writes to a non-PTY process are rejected because stdin is already closed.
+- Writes to a non-PTY process are rejected unless it started with `pipeStdin`.
 
-### `command/exec/terminate`
+### `process/terminate`
 
 Terminates a running managed process.
 
@@ -182,7 +392,7 @@ If the process is already unknown or already removed, the server responds with:
 
 ## Notifications
 
-### `command/exec/outputDelta`
+### `process/output`
 
 Streaming output chunk from a running process.
 
@@ -191,6 +401,7 @@ Params:
 ```json
 {
   "processId": "proc-1",
+  "seq": 1,
   "stream": "stdout",
   "chunk": "aGVsbG8K"
 }
@@ -199,10 +410,11 @@ Params:
 Fields:
 
 - `processId`: process identifier
-- `stream`: `"stdout"` or `"stderr"`
+- `seq`: per-process output sequence number
+- `stream`: `"stdout"`, `"stderr"`, or `"pty"`
 - `chunk`: base64-encoded output bytes
 
-### `command/exec/exited`
+### `process/exited`
 
 Final process exit notification.
 
@@ -211,9 +423,56 @@ Params:
 ```json
 {
   "processId": "proc-1",
-  "exitCode": 0
+  "seq": 2,
+  "exitCode": 0,
+  "sandboxDenied": false
 }
 ```
+
+`sandboxDenied` lets streaming clients preserve executor-side sandbox denial
+detection without issuing a final `process/read` request. Clients recover it
+with `process/read` when an older server omits the field.
+
+### `process/closed`
+
+Notification emitted after process output is closed and the process handle is
+removed.
+
+Params:
+
+```json
+{
+  "processId": "proc-1",
+  "seq": 3
+}
+```
+
+## Filesystem RPCs
+
+Filesystem methods require valid `file:` URI strings and return JSON-RPC errors
+for invalid or unavailable paths. Native absolute path strings are rejected;
+callers must convert them to `file:` URIs before sending requests:
+
+- `fs/readFile`
+- `fs/open`, `fs/readBlock`, `fs/writeBlock`, and `fs/close` (file handles;
+  reads also back `ExecutorFileSystem::read_file_stream`)
+- `fs/writeFile`
+- `fs/createDirectory`
+- `fs/getMetadata`
+- `fs/canonicalize`
+- `fs/readDirectory`
+- `fs/remove`
+- `fs/copy`
+
+`fs/open.mode` is `read` (default) or `replace` (create or truncate for writing).
+Writable handles require `fileWriteStreaming`; `fs/writeBlock` writes a nonempty
+base64 `chunk` of up to 1 MiB at an explicit `offset`.
+
+Path-based filesystem requests accept an optional `sandbox` object. When `sandbox`
+contains a `ReadOnly` or `WorkspaceWrite` policy, the operation runs in a
+hidden helper process launched from the top-level `codex` executable and
+prepared through the shared sandbox transform path. Helper requests and
+responses are passed over stdin/stdout.
 
 ## Errors
 
@@ -231,6 +490,7 @@ Typical error cases:
 - duplicate `processId`
 - writes to unknown processes
 - writes to non-PTY processes
+- sandbox-denied filesystem operations
 
 ## Rust surface
 
@@ -240,10 +500,30 @@ The crate exports:
 - `ExecServerError`
 - `ExecServerClientConnectOptions`
 - `RemoteExecServerConnectArgs`
-- protocol structs `InitializeParams` and `InitializeResponse`
+- protocol request/response structs for process and filesystem RPCs
 - `DEFAULT_LISTEN_URL` and `ExecServerListenUrlParseError`
-- `run_main_with_listen_url()`
-- `run_main()` for embedding the websocket server in a binary
+- `ExecServerRuntimeOptions`
+- `run_main()` for embedding the websocket server
+- `RemoteEnvironmentConfig` and `run_remote_environment()` for embedding remote
+  registration mode
+
+Callers must pass `ExecServerRuntimeOptions` and an explicitly configured
+`HttpClientFactory` to `run_main()`. The top-level `codex exec-server` command
+builds the runtime options from the `codex` arg0 dispatch state and startup flags,
+and resolves its HTTP client factory from the effective Codex configuration.
+`RemoteEnvironmentConfig::new(...)` also takes the auth provider and HTTP client
+factory that remote registration mode should use; the CLI builds the auth
+provider from Codex auth state before starting remote mode.
+
+`--proxy-private-ips-via-upstream` (or
+`CODEX_EXEC_SERVER_PROXY_PRIVATE_IPS_VIA_UPSTREAM=true`) allows permitted private IP
+destinations to use an inherited upstream proxy. If no valid proxy configuration
+applies to the request protocol, routing falls back to a direct connection. This
+includes unset, malformed, or unsupported proxy settings. Setting
+`allow_upstream_proxy=false` also keeps routing direct; loopback always stays local.
+Destination policy still applies to every route. Enforcing mandatory upstream routing
+would require a separate fail-closed mode. A connection failure after selecting an
+upstream proxy is returned as an error, without retrying directly.
 
 ## Example session
 
@@ -251,30 +531,31 @@ Initialize:
 
 ```json
 {"id":1,"method":"initialize","params":{"clientName":"example-client"}}
-{"id":1,"result":{}}
+{"id":1,"result":{"sessionId":"00000000-0000-4000-8000-000000000001","environmentInfo":{"shell":{"name":"bash","path":"/bin/bash"},"cwd":"file:///tmp"}}}
 {"method":"initialized","params":{}}
 ```
 
 Start a process:
 
 ```json
-{"id":2,"method":"command/exec","params":{"processId":"proc-1","argv":["bash","-lc","printf 'ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done"],"cwd":"/tmp","env":{"PATH":"/usr/bin:/bin"},"tty":true,"outputBytesCap":4096,"arg0":null}}
-{"id":2,"result":{"processId":"proc-1","running":true,"exitCode":null,"stdout":null,"stderr":null}}
-{"method":"command/exec/outputDelta","params":{"processId":"proc-1","stream":"stdout","chunk":"cmVhZHkK"}}
+{"id":2,"method":"process/start","params":{"processId":"proc-1","argv":["bash","-lc","printf 'ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done"],"cwd":"file:///tmp","env":{"PATH":"/usr/bin:/bin"},"tty":true,"pipeStdin":false,"arg0":null}}
+{"id":2,"result":{"processId":"proc-1"}}
+{"method":"process/output","params":{"processId":"proc-1","seq":1,"stream":"stdout","chunk":"cmVhZHkK"}}
 ```
 
 Write to the process:
 
 ```json
-{"id":3,"method":"command/exec/write","params":{"processId":"proc-1","chunk":"aGVsbG8K"}}
-{"id":3,"result":{"accepted":true}}
-{"method":"command/exec/outputDelta","params":{"processId":"proc-1","stream":"stdout","chunk":"ZWNobzpoZWxsbwo="}}
+{"id":3,"method":"process/write","params":{"processId":"proc-1","chunk":"aGVsbG8K"}}
+{"id":3,"result":{"status":"accepted"}}
+{"method":"process/output","params":{"processId":"proc-1","seq":2,"stream":"stdout","chunk":"ZWNobzpoZWxsbwo="}}
 ```
 
 Terminate it:
 
 ```json
-{"id":4,"method":"command/exec/terminate","params":{"processId":"proc-1"}}
+{"id":4,"method":"process/terminate","params":{"processId":"proc-1"}}
 {"id":4,"result":{"running":true}}
-{"method":"command/exec/exited","params":{"processId":"proc-1","exitCode":0}}
+{"method":"process/exited","params":{"processId":"proc-1","seq":3,"exitCode":0,"sandboxDenied":false}}
+{"method":"process/closed","params":{"processId":"proc-1","seq":4}}
 ```

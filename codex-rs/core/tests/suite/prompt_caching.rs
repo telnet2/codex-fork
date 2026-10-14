@@ -1,33 +1,52 @@
 #![allow(clippy::unwrap_used)]
 
-use codex_apply_patch::APPLY_PATCH_TOOL_INSTRUCTIONS;
-use codex_core::shell::Shell;
+use core_test_support::test_codex::local_requests;
+use std::fs;
+use std::path::Path;
+use std::sync::Arc;
+
+use codex_core::TurnInputRequest;
 use codex_core::shell::default_user_shell;
 use codex_features::Feature;
+use codex_models_manager::bundled_models_response;
+use codex_models_manager::collaboration_mode_presets::builtin_collaboration_mode_presets;
+use codex_models_manager::manager::StaticModelsManager;
+use codex_prompts::render_model_instructions;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::Settings;
 use codex_protocol::config_types::WebSearchMode;
+use codex_protocol::models::PermissionProfile;
+use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::ENVIRONMENT_CONTEXT_OPEN_TAG;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::Op;
-use codex_protocol::protocol::SandboxPolicy;
+use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
-use codex_utils_absolute_path::AbsolutePathBuf;
+use core_test_support::TempDirExt;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
+use core_test_support::responses::strip_metadata_from_json;
+use core_test_support::responses::strip_response_item_ids_from_json;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
+use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
+use test_case::test_case;
+
+fn write_global_instructions(home: &Path) {
+    fs::write(home.join("AGENTS.md"), "be consistent and helpful")
+        .expect("write global instructions");
+}
 
 fn text_user_input(text: String) -> serde_json::Value {
     text_user_input_parts(vec![text])
@@ -44,19 +63,29 @@ fn text_user_input_parts(texts: Vec<String>) -> serde_json::Value {
     })
 }
 
-fn assert_default_env_context(text: &str, cwd: &str, shell: &Shell) {
-    let shell_name = shell.name();
-    assert!(
-        text.starts_with(ENVIRONMENT_CONTEXT_OPEN_TAG),
-        "expected environment context fragment: {text}"
+fn assert_eq_without_metadata_or_item_ids(left: serde_json::Value, right: serde_json::Value) {
+    assert_eq!(
+        strip_response_item_ids_from_json(strip_metadata_from_json(left)),
+        strip_response_item_ids_from_json(strip_metadata_from_json(right))
     );
+}
+
+fn assert_default_env_context(text: &str, cwd: &str) {
+    assert_env_context_fragment(text);
     assert!(
         text.contains(&format!("<cwd>{cwd}</cwd>")),
         "expected cwd in environment context: {text}"
     );
     assert!(
-        text.contains(&format!("<shell>{shell_name}</shell>")),
+        text.contains(&format!("<shell>{}</shell>", default_user_shell().name())),
         "expected shell in environment context: {text}"
+    );
+}
+
+fn assert_env_context_fragment(text: &str) {
+    assert!(
+        text.starts_with(ENVIRONMENT_CONTEXT_OPEN_TAG),
+        "expected environment context fragment: {text}"
     );
     assert!(
         text.contains("<current_date>") && text.contains("</current_date>"),
@@ -94,10 +123,42 @@ fn normalize_newlines(text: &str) -> String {
     text.replace("\r\n", "\n")
 }
 
+#[test_case(None, false, false; "default with model instructions")]
+#[test_case(Some(true), true, false; "enabled with model instructions")]
+#[test_case(Some(false), false, false; "disabled with model instructions")]
+#[test_case(None, false, true; "default with custom instructions")]
+#[test_case(Some(true), true, true; "enabled with custom instructions")]
+#[test_case(Some(false), false, true; "disabled with custom instructions")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prompt_tools_are_consistent_across_requests() -> anyhow::Result<()> {
+async fn prompt_tools_are_consistent_across_requests(
+    update_plan_enabled: Option<bool>,
+    expected_update_plan_enabled: bool,
+    custom_instructions: bool,
+) -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
     use pretty_assertions::assert_eq;
+
+    const CUSTOM_BASE_INSTRUCTIONS: &str =
+        "Custom base.\r\n## Plan tool\r\nPreserve this custom workflow.\r\n";
+    const MODEL_BASE_INSTRUCTIONS: &str = "Model base.\n\n## Planning\nYou have access to an `update_plan` tool which tracks steps.\n\n## Work\nKeep working.\n\n## `update_plan`\nUpdate the plan.\n";
+
+    let mut model = bundled_models_response()?
+        .models
+        .into_iter()
+        .find(|model| model.slug == "gpt-5.5")
+        .expect("bundled gpt-5.5 model");
+    model
+        .model_messages
+        .as_mut()
+        .expect("bundled model messages")
+        .instructions_template = Some(MODEL_BASE_INSTRUCTIONS.to_string());
+    // Supply model instructions without making them an explicit config catalog override.
+    let models_manager = Arc::new(StaticModelsManager::new(
+        /*auth_manager*/ None,
+        ModelsResponse {
+            models: vec![model],
+        },
+    ));
 
     let server = start_mock_server().await;
     let req1 = mount_sse_once(
@@ -112,14 +173,25 @@ async fn prompt_tools_are_consistent_across_requests() -> anyhow::Result<()> {
     .await;
 
     let TestCodex {
+        // Keep the file-backed instructions alive across request-boundary refreshes.
+        home: _home,
         codex,
         config,
         thread_manager,
         ..
     } = test_codex()
-        .with_config(|config| {
-            config.user_instructions = Some("be consistent and helpful".to_string());
-            config.model = Some("gpt-5.1-codex-max".to_string());
+        .with_models_manager(models_manager)
+        .with_pre_build_hook(write_global_instructions)
+        .with_config(move |config| {
+            config.model = Some("gpt-5.5".to_string());
+            if let Some(update_plan_enabled) = update_plan_enabled {
+                config.update_plan_enabled = update_plan_enabled;
+            }
+            if custom_instructions {
+                config.base_instructions = Some(CUSTOM_BASE_INSTRUCTIONS.to_string());
+                config.developer_instructions =
+                    Some("## `update_plan`\nNever deploy without explicit approval.\n".to_string());
+            }
             // Keep tool expectations stable when the default web_search mode changes.
             config
                 .web_search_mode
@@ -132,77 +204,109 @@ async fn prompt_tools_are_consistent_across_requests() -> anyhow::Result<()> {
         })
         .build(&server)
         .await?;
-    let base_instructions = thread_manager
+    let model_info = thread_manager
         .get_models_manager()
         .get_model_info(
             config
                 .model
                 .as_deref()
                 .expect("test config should have a model"),
-            &config,
+            &config.to_models_manager_config(),
         )
-        .await
-        .base_instructions;
+        .await;
+    let base_instructions = if custom_instructions {
+        CUSTOM_BASE_INSTRUCTIONS.to_string()
+    } else {
+        let original = render_model_instructions(&model_info);
+        if expected_update_plan_enabled {
+            original
+        } else {
+            let (before, planning) = original.split_once("## Planning\n").unwrap();
+            let (_, after) = planning.split_once("\n## ").unwrap();
+            let (after, _) = after.split_once("## `update_plan`\n").unwrap();
+            format!("{before}## {after}")
+        }
+    };
 
+    let mode_instructions = if custom_instructions {
+        "## Plan tool\nPreserve this custom collaboration policy.\n".to_string()
+    } else {
+        builtin_collaboration_mode_presets()
+            .into_iter()
+            .find(|preset| preset.mode == Some(ModeKind::Plan))
+            .and_then(|preset| preset.developer_instructions.flatten())
+            .expect("built-in Plan mode instructions")
+    };
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: "hello 1".into(),
                 text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-        })
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
+                collaboration_mode: Some(CollaborationMode {
+                    mode: ModeKind::Plan,
+                    settings: Settings {
+                        model: "gpt-5.5".to_string(),
+                        reasoning_effort: None,
+                        developer_instructions: Some(mode_instructions.clone()),
+                    },
+                }),
+                ..Default::default()
+            }),
+        )
         .await?;
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello 2".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "hello 2".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
-    let mut expected_tools_names = if cfg!(windows) {
-        vec!["shell_command"]
-    } else {
-        vec!["exec_command", "write_stdin"]
-    };
+    let mut expected_tools_names = vec!["exec_command", "write_stdin"];
+    if expected_update_plan_enabled {
+        expected_tools_names.push("update_plan");
+    }
     expected_tools_names.extend([
-        "update_plan",
         "request_user_input",
         "apply_patch",
-        "web_search",
         "view_image",
-        "spawn_agent",
-        "send_input",
-        "resume_agent",
-        "wait_agent",
-        "close_agent",
+        "tool_search",
+        "web_search",
     ]);
     let body0 = req1.single_request().body_json();
 
-    let expected_instructions = if expected_tools_names.contains(&"apply_patch") {
-        base_instructions
-    } else {
-        [base_instructions, APPLY_PATCH_TOOL_INSTRUCTIONS.to_string()].join("\n")
-    };
-
-    assert_eq!(
-        body0["instructions"],
-        serde_json::json!(expected_instructions),
-    );
+    assert_eq!(req1.single_request().instructions_text(), base_instructions);
     assert_tool_names(&body0, &expected_tools_names);
 
     let body1 = req2.single_request().body_json();
-    assert_eq!(
-        body1["instructions"],
-        serde_json::json!(expected_instructions),
-    );
+    assert_eq!(req2.single_request().instructions_text(), base_instructions);
     assert_tool_names(&body1, &expected_tools_names);
+
+    for request in [&req1, &req2] {
+        let developer_text = request
+            .single_request()
+            .message_input_texts("developer")
+            .join("\n");
+        if custom_instructions || expected_update_plan_enabled {
+            assert!(developer_text.contains(&mode_instructions));
+        } else {
+            assert!(!developer_text.contains("update_plan"));
+            assert!(developer_text.contains("Plan Mode (Conversational)"));
+        }
+        if let Some(instructions) = &config.developer_instructions {
+            assert!(
+                request
+                    .single_request()
+                    .message_input_texts("developer")
+                    .iter()
+                    .any(|text| text == instructions)
+            );
+        }
+    }
 
     Ok(())
 }
@@ -224,61 +328,47 @@ async fn gpt_5_tools_without_apply_patch_append_apply_patch_instructions() -> an
     )
     .await;
 
-    let TestCodex { codex, .. } = test_codex()
+    let TestCodex {
+        home: _home, codex, ..
+    } = test_codex()
+        .with_pre_build_hook(write_global_instructions)
         .with_config(|config| {
-            config.user_instructions = Some("be consistent and helpful".to_string());
-            config
-                .features
-                .disable(Feature::ApplyPatchFreeform)
-                .expect("test config should allow feature update");
             config
                 .features
                 .enable(Feature::CollaborationModes)
                 .expect("test config should allow feature update");
-            config.model = Some("gpt-5".to_string());
+            config.model = Some("gpt-5.2".to_string());
         })
         .build(&server)
         .await?;
 
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello 1".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "hello 1".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
 
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello 2".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "hello 2".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
 
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
-    let body0 = req1.single_request().body_json();
-    let instructions0 = body0["instructions"]
-        .as_str()
-        .expect("instructions should be a string");
+    let instructions0 = req1.single_request().instructions_text();
     assert!(
         instructions0.contains("You are"),
         "expected non-empty instructions"
     );
 
-    let body1 = req2.single_request().body_json();
-    let instructions1 = body1["instructions"]
-        .as_str()
-        .expect("instructions should be a string");
+    let instructions1 = req2.single_request().instructions_text();
     assert_eq!(
-        normalize_newlines(instructions1),
-        normalize_newlines(instructions0)
+        normalize_newlines(&instructions1),
+        normalize_newlines(&instructions0)
     );
 
     Ok(())
@@ -302,9 +392,14 @@ async fn prefixes_context_and_instructions_once_and_consistently_across_requests
     )
     .await;
 
-    let TestCodex { codex, config, .. } = test_codex()
+    let TestCodex {
+        home: _home,
+        codex,
+        config,
+        ..
+    } = test_codex()
+        .with_pre_build_hook(write_global_instructions)
         .with_config(|config| {
-            config.user_instructions = Some("be consistent and helpful".to_string());
             config
                 .features
                 .enable(Feature::CollaborationModes)
@@ -314,24 +409,18 @@ async fn prefixes_context_and_instructions_once_and_consistently_across_requests
         .await?;
 
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello 1".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "hello 1".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello 2".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "hello 2".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
@@ -339,11 +428,11 @@ async fn prefixes_context_and_instructions_once_and_consistently_across_requests
     let input1 = body1["input"].as_array().expect("input array");
     assert_eq!(
         input1.len(),
-        3,
-        "expected permissions + cached contextual user prefix + user msg"
+        4,
+        "expected base instructions + permissions + cached contextual user prefix + user msg"
     );
 
-    let ui_text = input1[1]["content"][0]["text"]
+    let ui_text = input1[2]["content"][0]["text"]
         .as_str()
         .expect("ui message text");
     assert!(
@@ -351,27 +440,31 @@ async fn prefixes_context_and_instructions_once_and_consistently_across_requests
         "expected user instructions in UI message: {ui_text}"
     );
 
-    let shell = default_user_shell();
     let cwd_str = config.cwd.to_string_lossy();
-    let env_text = input1[1]["content"][1]["text"]
+    let env_text = input1[2]["content"][1]["text"]
         .as_str()
         .expect("environment context text");
-    assert_default_env_context(env_text, &cwd_str, &shell);
+    assert_default_env_context(env_text, &cwd_str);
     assert_eq!(
-        input1[1]["content"][1]["type"].as_str(),
+        input1[2]["content"][1]["type"].as_str(),
         Some("input_text"),
         "expected environment context bundled after UI message in cached contextual message"
     );
-    assert_eq!(input1[2], text_user_input("hello 1".to_string()));
+    assert_eq_without_metadata_or_item_ids(
+        input1[3].clone(),
+        text_user_input("hello 1".to_string()),
+    );
 
     let body2 = req2.single_request().body_json();
     let input2 = body2["input"].as_array().expect("input array");
-    assert_eq!(
-        &input2[..input1.len()],
-        input1.as_slice(),
-        "expected cached prefix to be reused"
+    assert_eq_without_metadata_or_item_ids(
+        serde_json::Value::Array(input2[..input1.len()].to_vec()),
+        serde_json::Value::Array(input1.to_vec()),
     );
-    assert_eq!(input2[input1.len()], text_user_input("hello 2".to_string()));
+    assert_eq_without_metadata_or_item_ids(
+        input2[input1.len()].clone(),
+        text_user_input("hello 2".to_string()),
+    );
 
     Ok(())
 }
@@ -393,9 +486,14 @@ async fn overrides_turn_context_but_keeps_cached_prefix_and_key_constant() -> an
     )
     .await;
 
-    let TestCodex { codex, .. } = test_codex()
+    let TestCodex {
+        home: _home,
+        codex,
+        config,
+        ..
+    } = test_codex()
+        .with_pre_build_hook(write_global_instructions)
         .with_config(|config| {
-            config.user_instructions = Some("be consistent and helpful".to_string());
             config
                 .features
                 .enable(Feature::CollaborationModes)
@@ -406,49 +504,42 @@ async fn overrides_turn_context_but_keeps_cached_prefix_and_key_constant() -> an
 
     // First turn
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello 1".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "hello 1".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     let writable = TempDir::new().unwrap();
-    let new_policy = SandboxPolicy::WorkspaceWrite {
-        writable_roots: vec![writable.path().try_into().unwrap()],
-        read_only_access: Default::default(),
-        network_access: true,
-        exclude_tmpdir_env_var: true,
-        exclude_slash_tmp: true,
-    };
-    codex
-        .submit(Op::OverrideTurnContext {
-            cwd: None,
+    let permission_profile = PermissionProfile::workspace_write_with(
+        &[writable.abs()],
+        NetworkSandboxPolicy::Enabled,
+        /*exclude_tmpdir_env_var*/ true,
+        /*exclude_slash_tmp*/ true,
+    );
+    let sandbox_policy = permission_profile
+        .to_legacy_sandbox_policy(config.cwd.as_path())
+        .expect("workspace profile should have legacy projection");
+    core_test_support::submit_thread_settings(
+        &codex,
+        ThreadSettingsOverrides {
             approval_policy: Some(AskForApproval::Never),
-            approvals_reviewer: None,
-            sandbox_policy: Some(new_policy.clone()),
-            windows_sandbox_level: None,
-            model: None,
+            sandbox_policy: Some(sandbox_policy),
+            permission_profile: Some(permission_profile),
             effort: Some(Some(ReasoningEffort::High)),
             summary: Some(ReasoningSummary::Detailed),
-            service_tier: None,
-            collaboration_mode: None,
-            personality: None,
-        })
-        .await?;
+            ..Default::default()
+        },
+    )
+    .await?;
 
     // Second turn after overrides
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello 2".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "hello 2".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
@@ -471,16 +562,35 @@ async fn overrides_turn_context_but_keeps_cached_prefix_and_key_constant() -> an
     });
     let expected_permissions_msg = body1["input"][0].clone();
     let body1_input = body1["input"].as_array().expect("input array");
-    // After overriding the turn context, emit one updated permissions message.
+    // After overriding the thread settings, emit one updated permissions message.
     let expected_permissions_msg_2 = body2["input"][body1_input.len()].clone();
     assert_ne!(
         expected_permissions_msg_2, expected_permissions_msg,
         "expected updated permissions message after override"
     );
+    let expected_env_msg_2 = body2["input"][body1_input.len() + 1].clone();
+    assert_eq!(expected_env_msg_2["role"].as_str(), Some("user"));
+    let env_text = expected_env_msg_2["content"][0]["text"]
+        .as_str()
+        .expect("environment context text");
+    assert_env_context_fragment(env_text);
+    assert!(
+        env_text.contains("<permission_profile type=\"managed\">")
+            && env_text.contains("<file_system type=\"restricted\">")
+            && env_text.contains(&format!(
+                "<entry access=\"write\"><path>{}</path></entry>",
+                writable.abs().display()
+            )),
+        "expected workspace-write filesystem profile in environment context: {env_text}"
+    );
     let mut expected_body2 = body1_input.to_vec();
     expected_body2.push(expected_permissions_msg_2);
+    expected_body2.push(expected_env_msg_2);
     expected_body2.push(expected_user_message_2);
-    assert_eq!(body2["input"], serde_json::Value::Array(expected_body2));
+    assert_eq_without_metadata_or_item_ids(
+        body2["input"].clone(),
+        serde_json::Value::Array(expected_body2),
+    );
 
     Ok(())
 }
@@ -501,42 +611,35 @@ async fn override_before_first_turn_emits_environment_context() -> anyhow::Resul
     let collaboration_mode = CollaborationMode {
         mode: ModeKind::Default,
         settings: Settings {
-            model: "gpt-5.1".to_string(),
+            model: "gpt-5.4".to_string(),
             reasoning_effort: Some(ReasoningEffort::High),
             developer_instructions: None,
         },
     };
 
-    codex
-        .submit(Op::OverrideTurnContext {
-            cwd: None,
+    core_test_support::submit_thread_settings(
+        &codex,
+        ThreadSettingsOverrides {
             approval_policy: Some(AskForApproval::Never),
-            approvals_reviewer: None,
-            sandbox_policy: None,
-            windows_sandbox_level: None,
-            model: Some("gpt-5.1-codex".to_string()),
+            model: Some("gpt-5.4".to_string()),
             effort: Some(Some(ReasoningEffort::Low)),
-            summary: None,
-            service_tier: None,
             collaboration_mode: Some(collaboration_mode),
-            personality: None,
-        })
-        .await?;
+            ..Default::default()
+        },
+    )
+    .await?;
 
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "first message".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "first message".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
 
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     let body = req.single_request().body_json();
-    assert_eq!(body["model"].as_str(), Some("gpt-5.1"));
+    assert_eq!(body["model"].as_str(), Some("gpt-5.4"));
     assert_eq!(
         body.get("reasoning")
             .and_then(|reasoning| reasoning.get("effort"))
@@ -605,16 +708,10 @@ async fn override_before_first_turn_emits_environment_context() -> anyhow::Resul
 
     let permissions_texts: Vec<&str> = input
         .iter()
-        .filter_map(|msg| {
-            let role = msg["role"].as_str()?;
-            if role != "developer" {
-                return None;
-            }
-            msg["content"]
-                .as_array()
-                .and_then(|content| content.first())
-                .and_then(|item| item["text"].as_str())
-        })
+        .filter(|msg| msg["role"].as_str() == Some("developer"))
+        .filter_map(|msg| msg["content"].as_array())
+        .flatten()
+        .filter_map(|item| item["text"].as_str())
         .collect();
     assert!(
         permissions_texts.iter().any(|text| {
@@ -662,9 +759,11 @@ async fn per_turn_overrides_keep_cached_prefix_and_key_constant() -> anyhow::Res
     )
     .await;
 
-    let TestCodex { codex, .. } = test_codex()
+    let TestCodex {
+        home: _home, codex, ..
+    } = test_codex()
+        .with_pre_build_hook(write_global_instructions)
         .with_config(|config| {
-            config.user_instructions = Some("be consistent and helpful".to_string());
             config
                 .features
                 .enable(Feature::CollaborationModes)
@@ -675,43 +774,41 @@ async fn per_turn_overrides_keep_cached_prefix_and_key_constant() -> anyhow::Res
 
     // First turn
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello 1".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "hello 1".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
-    // Second turn using per-turn overrides via UserTurn
+    // Second turn using per-turn thread-settings overrides.
     let new_cwd = TempDir::new().unwrap();
     let writable = TempDir::new().unwrap();
-    let new_policy = SandboxPolicy::WorkspaceWrite {
-        writable_roots: vec![AbsolutePathBuf::try_from(writable.path()).unwrap()],
-        read_only_access: Default::default(),
-        network_access: true,
-        exclude_tmpdir_env_var: true,
-        exclude_slash_tmp: true,
-    };
+    let permission_profile = PermissionProfile::workspace_write_with(
+        &[writable.abs()],
+        NetworkSandboxPolicy::Enabled,
+        /*exclude_tmpdir_env_var*/ true,
+        /*exclude_slash_tmp*/ true,
+    );
+    let (sandbox_policy, permission_profile) =
+        turn_permission_fields(permission_profile, new_cwd.path());
     codex
-        .submit(Op::UserTurn {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: "hello 2".into(),
                 text_elements: Vec::new(),
-            }],
-            cwd: new_cwd.path().to_path_buf(),
-            approval_policy: AskForApproval::Never,
-            sandbox_policy: new_policy.clone(),
-            model: "o3".to_string(),
-            effort: Some(ReasoningEffort::High),
-            summary: Some(ReasoningSummary::Detailed),
-            service_tier: None,
-            collaboration_mode: None,
-            final_output_json_schema: None,
-            personality: None,
-        })
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
+                environments: Some(local_requests(new_cwd.abs())),
+                approval_policy: Some(AskForApproval::Never),
+                sandbox_policy: Some(sandbox_policy),
+                permission_profile,
+                model: Some("o3".to_string()),
+                effort: Some(Some(ReasoningEffort::High)),
+                summary: Some(ReasoningSummary::Detailed),
+                ..Default::default()
+            }),
+        )
         .await?;
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
@@ -736,10 +833,6 @@ async fn per_turn_overrides_keep_cached_prefix_and_key_constant() -> anyhow::Res
     let expected_permissions_msg = body1["input"][0].clone();
     let body1_input = body1["input"].as_array().expect("input array");
     let expected_settings_update_msg = body2["input"][body1_input.len()].clone();
-    assert_ne!(
-        expected_settings_update_msg, expected_permissions_msg,
-        "expected updated permissions message after per-turn override"
-    );
     assert_eq!(
         expected_settings_update_msg["role"].as_str(),
         Some("developer")
@@ -750,19 +843,31 @@ async fn per_turn_overrides_keep_cached_prefix_and_key_constant() -> anyhow::Res
         }),
         "expected model switch section after model override: {expected_settings_update_msg:?}"
     );
-    let expected_env_msg_2 = body2["input"][body1_input.len() + 1].clone();
+    let expected_permissions_update_msg = body2["input"][body1_input.len() + 1].clone();
+    assert_ne!(
+        expected_permissions_update_msg, expected_permissions_msg,
+        "expected updated permissions message after per-turn override"
+    );
+    assert_eq!(
+        expected_permissions_update_msg["role"].as_str(),
+        Some("developer")
+    );
+    let expected_env_msg_2 = body2["input"][body1_input.len() + 2].clone();
     assert_eq!(expected_env_msg_2["role"].as_str(), Some("user"));
     let env_text = expected_env_msg_2["content"][0]["text"]
         .as_str()
         .expect("environment context text");
-    let shell = default_user_shell();
     let expected_cwd = new_cwd.path().display().to_string();
-    assert_default_env_context(env_text, &expected_cwd, &shell);
+    assert_default_env_context(env_text, &expected_cwd);
     let mut expected_body2 = body1_input.to_vec();
     expected_body2.push(expected_settings_update_msg);
+    expected_body2.push(expected_permissions_update_msg);
     expected_body2.push(expected_env_msg_2);
     expected_body2.push(expected_user_message_2);
-    assert_eq!(body2["input"], serde_json::Value::Array(expected_body2));
+    assert_eq_without_metadata_or_item_ids(
+        body2["input"].clone(),
+        serde_json::Value::Array(expected_body2),
+    );
 
     Ok(())
 }
@@ -770,7 +875,6 @@ async fn per_turn_overrides_keep_cached_prefix_and_key_constant() -> anyhow::Res
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn send_user_turn_with_no_changes_does_not_send_environment_context() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
-    use pretty_assertions::assert_eq;
 
     let server = start_mock_server().await;
     let req1 = mount_sse_once(
@@ -785,13 +889,14 @@ async fn send_user_turn_with_no_changes_does_not_send_environment_context() -> a
     .await;
 
     let TestCodex {
+        home: _home,
         codex,
         config,
         session_configured,
         ..
     } = test_codex()
+        .with_pre_build_hook(write_global_instructions)
         .with_config(|config| {
-            config.user_instructions = Some("be consistent and helpful".to_string());
             config
                 .features
                 .enable(Feature::CollaborationModes)
@@ -802,48 +907,58 @@ async fn send_user_turn_with_no_changes_does_not_send_environment_context() -> a
 
     let default_cwd = config.cwd.clone();
     let default_approval_policy = config.permissions.approval_policy.value();
-    let default_sandbox_policy = config.permissions.sandbox_policy.get();
+    let default_sandbox_policy = &config.legacy_sandbox_policy();
     let default_model = session_configured.model;
-    let default_effort = config.model_reasoning_effort;
+    let default_effort = config.model_reasoning_effort.clone();
     let default_summary = config.model_reasoning_summary;
 
     codex
-        .submit(Op::UserTurn {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: "hello 1".into(),
                 text_elements: Vec::new(),
-            }],
-            cwd: default_cwd.clone(),
-            approval_policy: default_approval_policy,
-            sandbox_policy: default_sandbox_policy.clone(),
-            model: default_model.clone(),
-            effort: default_effort,
-            summary: Some(default_summary.unwrap_or(ReasoningSummary::Auto)),
-            service_tier: None,
-            collaboration_mode: None,
-            final_output_json_schema: None,
-            personality: None,
-        })
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
+                environments: Some(local_requests(default_cwd.clone())),
+                approval_policy: Some(default_approval_policy),
+                sandbox_policy: Some(default_sandbox_policy.clone()),
+                summary: Some(default_summary.unwrap_or(ReasoningSummary::Auto)),
+                collaboration_mode: Some(CollaborationMode {
+                    mode: ModeKind::Default,
+                    settings: Settings {
+                        model: default_model.clone(),
+                        reasoning_effort: default_effort.clone(),
+                        developer_instructions: None,
+                    },
+                }),
+                ..Default::default()
+            }),
+        )
         .await?;
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     codex
-        .submit(Op::UserTurn {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: "hello 2".into(),
                 text_elements: Vec::new(),
-            }],
-            cwd: default_cwd.clone(),
-            approval_policy: default_approval_policy,
-            sandbox_policy: default_sandbox_policy.clone(),
-            model: default_model.clone(),
-            effort: default_effort,
-            summary: Some(default_summary.unwrap_or(ReasoningSummary::Auto)),
-            service_tier: None,
-            collaboration_mode: None,
-            final_output_json_schema: None,
-            personality: None,
-        })
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
+                environments: Some(local_requests(default_cwd.clone())),
+                approval_policy: Some(default_approval_policy),
+                sandbox_policy: Some(default_sandbox_policy.clone()),
+                summary: Some(default_summary.unwrap_or(ReasoningSummary::Auto)),
+                collaboration_mode: Some(CollaborationMode {
+                    mode: ModeKind::Default,
+                    settings: Settings {
+                        model: default_model.clone(),
+                        reasoning_effort: default_effort,
+                        developer_instructions: None,
+                    },
+                }),
+                ..Default::default()
+            }),
+        )
         .await?;
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
@@ -852,16 +967,16 @@ async fn send_user_turn_with_no_changes_does_not_send_environment_context() -> a
     let body1 = request1.body_json();
     let body2 = request2.body_json();
 
-    let expected_permissions_msg = body1["input"][0].clone();
-    let expected_ui_msg = body1["input"][1].clone();
+    let expected_base_instructions = body1["input"][0].clone();
+    let expected_permissions_msg = body1["input"][1].clone();
+    let expected_ui_msg = body1["input"][2].clone();
 
-    let shell = default_user_shell();
     let default_cwd_lossy = default_cwd.to_string_lossy();
     let expected_env_text_1 = expected_ui_msg["content"][1]["text"]
         .as_str()
         .expect("cached environment context text")
         .to_string();
-    assert_default_env_context(&expected_env_text_1, &default_cwd_lossy, &shell);
+    assert_default_env_context(&expected_env_text_1, &default_cwd_lossy);
 
     let expected_contextual_user_msg_1 = text_user_input_parts(vec![
         expected_ui_msg["content"][0]["text"]
@@ -873,20 +988,22 @@ async fn send_user_turn_with_no_changes_does_not_send_environment_context() -> a
     let expected_user_message_1 = text_user_input("hello 1".to_string());
 
     let expected_input_1 = serde_json::Value::Array(vec![
+        expected_base_instructions.clone(),
         expected_permissions_msg.clone(),
         expected_contextual_user_msg_1.clone(),
         expected_user_message_1.clone(),
     ]);
-    assert_eq!(body1["input"], expected_input_1);
+    assert_eq_without_metadata_or_item_ids(body1["input"].clone(), expected_input_1);
 
     let expected_user_message_2 = text_user_input("hello 2".to_string());
     let expected_input_2 = serde_json::Value::Array(vec![
+        expected_base_instructions,
         expected_permissions_msg,
         expected_contextual_user_msg_1,
         expected_user_message_1,
         expected_user_message_2,
     ]);
-    assert_eq!(body2["input"], expected_input_2);
+    assert_eq_without_metadata_or_item_ids(body2["input"].clone(), expected_input_2);
 
     Ok(())
 }
@@ -909,13 +1026,14 @@ async fn send_user_turn_with_changes_sends_environment_context() -> anyhow::Resu
     )
     .await;
     let TestCodex {
+        home: _home,
         codex,
         config,
         session_configured,
         ..
     } = test_codex()
+        .with_pre_build_hook(write_global_instructions)
         .with_config(|config| {
-            config.user_instructions = Some("be consistent and helpful".to_string());
             config
                 .features
                 .enable(Feature::CollaborationModes)
@@ -926,48 +1044,61 @@ async fn send_user_turn_with_changes_sends_environment_context() -> anyhow::Resu
 
     let default_cwd = config.cwd.clone();
     let default_approval_policy = config.permissions.approval_policy.value();
-    let default_sandbox_policy = config.permissions.sandbox_policy.get();
+    let default_sandbox_policy = &config.legacy_sandbox_policy();
     let default_model = session_configured.model;
-    let default_effort = config.model_reasoning_effort;
+    let default_effort = config.model_reasoning_effort.clone();
     let default_summary = config.model_reasoning_summary;
 
     codex
-        .submit(Op::UserTurn {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: "hello 1".into(),
                 text_elements: Vec::new(),
-            }],
-            cwd: default_cwd.clone(),
-            approval_policy: default_approval_policy,
-            sandbox_policy: default_sandbox_policy.clone(),
-            model: default_model,
-            effort: default_effort,
-            summary: Some(default_summary.unwrap_or(ReasoningSummary::Auto)),
-            service_tier: None,
-            collaboration_mode: None,
-            final_output_json_schema: None,
-            personality: None,
-        })
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
+                environments: Some(local_requests(default_cwd.clone())),
+                approval_policy: Some(default_approval_policy),
+                sandbox_policy: Some(default_sandbox_policy.clone()),
+                summary: Some(default_summary.unwrap_or(ReasoningSummary::Auto)),
+                collaboration_mode: Some(CollaborationMode {
+                    mode: ModeKind::Default,
+                    settings: Settings {
+                        model: default_model,
+                        reasoning_effort: default_effort,
+                        developer_instructions: None,
+                    },
+                }),
+                ..Default::default()
+            }),
+        )
         .await?;
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
+    let (sandbox_policy, permission_profile) =
+        turn_permission_fields(PermissionProfile::Disabled, default_cwd.as_path());
     codex
-        .submit(Op::UserTurn {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: "hello 2".into(),
                 text_elements: Vec::new(),
-            }],
-            cwd: default_cwd.clone(),
-            approval_policy: AskForApproval::Never,
-            sandbox_policy: SandboxPolicy::DangerFullAccess,
-            model: "o3".to_string(),
-            effort: Some(ReasoningEffort::High),
-            summary: Some(ReasoningSummary::Detailed),
-            service_tier: None,
-            collaboration_mode: None,
-            final_output_json_schema: None,
-            personality: None,
-        })
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
+                environments: Some(local_requests(default_cwd.clone())),
+                approval_policy: Some(AskForApproval::Never),
+                sandbox_policy: Some(sandbox_policy),
+                permission_profile,
+                summary: Some(ReasoningSummary::Detailed),
+                collaboration_mode: Some(CollaborationMode {
+                    mode: ModeKind::Default,
+                    settings: Settings {
+                        model: "o3".to_string(),
+                        reasoning_effort: Some(ReasoningEffort::High),
+                        developer_instructions: None,
+                    },
+                }),
+                ..Default::default()
+            }),
+        )
         .await?;
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
@@ -976,15 +1107,15 @@ async fn send_user_turn_with_changes_sends_environment_context() -> anyhow::Resu
     let body1 = request1.body_json();
     let body2 = request2.body_json();
 
-    let expected_permissions_msg = body1["input"][0].clone();
-    let expected_ui_msg = body1["input"][1].clone();
+    let expected_base_instructions = body1["input"][0].clone();
+    let expected_permissions_msg = body1["input"][1].clone();
+    let expected_ui_msg = body1["input"][2].clone();
 
-    let shell = default_user_shell();
     let expected_env_text_1 = expected_ui_msg["content"][1]["text"]
         .as_str()
         .expect("cached environment context text")
         .to_string();
-    assert_default_env_context(&expected_env_text_1, &default_cwd.to_string_lossy(), &shell);
+    assert_default_env_context(&expected_env_text_1, &default_cwd.to_string_lossy());
     let expected_contextual_user_msg_1 = text_user_input_parts(vec![
         expected_ui_msg["content"][0]["text"]
             .as_str()
@@ -994,18 +1125,15 @@ async fn send_user_turn_with_changes_sends_environment_context() -> anyhow::Resu
     ]);
     let expected_user_message_1 = text_user_input("hello 1".to_string());
     let expected_input_1 = serde_json::Value::Array(vec![
+        expected_base_instructions.clone(),
         expected_permissions_msg.clone(),
         expected_contextual_user_msg_1.clone(),
         expected_user_message_1.clone(),
     ]);
-    assert_eq!(body1["input"], expected_input_1);
+    assert_eq_without_metadata_or_item_ids(body1["input"].clone(), expected_input_1);
 
     let body1_input = body1["input"].as_array().expect("input array");
     let expected_settings_update_msg = body2["input"][body1_input.len()].clone();
-    assert_ne!(
-        expected_settings_update_msg, expected_permissions_msg,
-        "expected updated permissions message after policy change"
-    );
     assert_eq!(
         expected_settings_update_msg["role"].as_str(),
         Some("developer")
@@ -1016,15 +1144,39 @@ async fn send_user_turn_with_changes_sends_environment_context() -> anyhow::Resu
         }),
         "expected model switch section after model override: {expected_settings_update_msg:?}"
     );
+    let expected_permissions_update_msg = body2["input"][body1_input.len() + 1].clone();
+    assert_ne!(
+        expected_permissions_update_msg, expected_permissions_msg,
+        "expected updated permissions message after policy change"
+    );
+    assert_eq!(
+        expected_permissions_update_msg["role"].as_str(),
+        Some("developer")
+    );
+    let expected_env_update_msg = body2["input"][body1_input.len() + 2].clone();
+    assert_eq!(expected_env_update_msg["role"].as_str(), Some("user"));
+    let expected_env_update_text = expected_env_update_msg["content"][0]["text"]
+        .as_str()
+        .expect("environment context text");
+    assert_env_context_fragment(expected_env_update_text);
+    assert!(
+        expected_env_update_text.contains(
+            "<permission_profile type=\"disabled\"><file_system type=\"unrestricted\" /></permission_profile>",
+        ),
+        "expected disabled filesystem profile in environment context: {expected_env_update_text}"
+    );
     let expected_user_message_2 = text_user_input("hello 2".to_string());
     let expected_input_2 = serde_json::Value::Array(vec![
+        expected_base_instructions,
         expected_permissions_msg,
         expected_contextual_user_msg_1,
         expected_user_message_1,
         expected_settings_update_msg,
+        expected_permissions_update_msg,
+        expected_env_update_msg,
         expected_user_message_2,
     ]);
-    assert_eq!(body2["input"], expected_input_2);
+    assert_eq_without_metadata_or_item_ids(body2["input"].clone(), expected_input_2);
 
     Ok(())
 }
