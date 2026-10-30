@@ -9,6 +9,7 @@ use super::app_server_event_targets::ServerNotificationThreadTarget;
 use super::app_server_event_targets::server_notification_thread_target;
 use super::app_server_event_targets::server_request_thread_id;
 use super::*;
+use crate::app_server_session::is_server_shutting_down_error;
 use crate::app_server_session::source_agent_path;
 use crate::app_server_session::thread_blocks_direct_input;
 use crate::chatwidget::ThreadInputStateRestoreMode;
@@ -450,6 +451,9 @@ impl App {
                 // `thread/read` can seed replay state, but it does not attach the app-server
                 // listener that `thread/resume` establishes, so treat this path as replay-only.
                 session.model.clear();
+                if was_external_writer {
+                    app_server.freeze_viewed_receipt(thread_id);
+                }
                 (session, turns, false)
             }
         };
@@ -479,8 +483,8 @@ impl App {
         Ok(live_attached)
     }
 
-    /// Replaces the chat widget, carrying the editor yank and re-seeding collab metadata from the
-    /// navigation cache.
+    /// Replaces the chat widget, carrying composer preferences and the editor yank, and
+    /// re-seeding collab metadata from the navigation cache.
     ///
     /// Thread switches reconstruct the `ChatWidget`, which loses the `collab_agent_metadata` map.
     /// This helper copies every known nickname/role from `AgentNavigationState` into the
@@ -512,12 +516,11 @@ impl App {
             chat_widget.windows_sandbox_elevated_setup_complete =
                 self.chat_widget.windows_sandbox_elevated_setup_complete;
         }
-        chat_widget.set_agents_navigation_enabled(matches!(
-            self.app_server_target,
-            AppServerTarget::LocalDaemon { .. }
-        ));
         chat_widget.inherit_backend_banner_state(&mut self.chat_widget);
         chat_widget.inherit_security_setup(&mut self.chat_widget);
+        chat_widget
+            .mention_usage_mut()
+            .inherit(self.chat_widget.mention_usage_mut());
         for (thread_id, entry) in self.agent_navigation.ordered_threads() {
             chat_widget.set_collab_agent_metadata(
                 thread_id,
@@ -879,6 +882,18 @@ impl App {
             return Ok(());
         }
 
+        // A refusal proves no thread was created.
+        if let Err(error) = &result
+            && matches!(
+                error.downcast_ref::<TypedRequestError>(),
+                Some(TypedRequestError::Server { method, source })
+                    if method == "thread/start" && is_server_shutting_down_error(source)
+            )
+            && self.begin_reconnect_for_rejected_startup()
+        {
+            return Ok(());
+        }
+
         self.pending_startup_thread_start = false;
         self.chat_widget
             .set_queue_submissions_until_session_configured(/*queue*/ false);
@@ -925,7 +940,6 @@ impl App {
                 }
                 // Lifecycle notifications may arrive before the thread/start response.
                 if !self.config.ephemeral
-                    && !matches!(self.app_server_target, AppServerTarget::Embedded)
                     && !self.pending_primary_events.iter().any(|event| {
                         matches!(event, ThreadBufferedEvent::Notification(notification)
                             if matches!(notification.as_ref(),
@@ -942,6 +956,12 @@ impl App {
                 // A full usage read can finish before thread/start. Apply its cached fallback
                 // after attachment but before the initial prompt or queued draft is submitted.
                 let recovery_was_pending = self.chat_widget.hold_rate_limit_recovery();
+                if self.loader_overrides.user_config_profile.is_none() {
+                    self.chat_widget.accept_startup_approval_policy(
+                        &mut self.config.permissions.approval_policy,
+                        started.session.approval_policy,
+                    )?;
+                }
                 self.enqueue_primary_thread_session(started.session, started.turns)
                     .await?;
                 self.apply_backend_banner_fallback(app_server).await;
@@ -986,6 +1006,28 @@ impl App {
                 self.chat_widget.restore_user_message_to_composer(message);
             }
             return;
+        }
+        // Dismissing the initial agents overview can expose /new before any folder consent.
+        // Resolve trust before loading defaults and applying explicit permission choices.
+        if self.current_displayed_thread_id().is_none() {
+            let mut config = self.chat_widget.config_ref().clone();
+            let cwd = config.cwd.to_path_buf();
+            if let Err(control) = self
+                .confirm_directory_trust(
+                    tui,
+                    app_server,
+                    &mut config,
+                    &cwd,
+                    crate::onboarding::DirectoryTrustOptions::default(),
+                    /*startup_draft*/ None,
+                )
+                .await
+            {
+                if matches!(control, AppRunControl::Exit(_)) {
+                    self.app_event_tx.send(AppEvent::Exit(ExitMode::Immediate));
+                }
+                return;
+            }
         }
         // Start a fresh in-memory session while preserving resumability via persisted rollout
         // history. If an initial message is provided, `enqueue_primary_thread_session` suppresses it
@@ -1056,9 +1098,7 @@ impl App {
                     None
                 };
                 let thread_id = started.session.thread_id;
-                if !self.config.ephemeral
-                    && !matches!(self.app_server_target, AppServerTarget::Embedded)
-                {
+                if !self.config.ephemeral {
                     self.agents_overview
                         .blank_sessions
                         .insert(thread_id, started.clone());
@@ -1300,6 +1340,10 @@ impl App {
         app_server: &mut AppServerSession,
         target_session: SessionTarget,
     ) -> Result<AppRunControl> {
+        if let Err(error) = target_session.ensure_backend(app_server.backend_id()) {
+            self.add_session_picker_error(error.to_string());
+            return Ok(AppRunControl::Continue);
+        }
         if self.ignore_same_thread_resume(&target_session) {
             self.agents_overview
                 .hidden_threads
@@ -1319,62 +1363,47 @@ impl App {
         if self.reject_pending_permission_root_switch() {
             return Ok(AppRunControl::Continue);
         }
-        let (mut resume_config, local_settings) = match self
-            .resume_config_for_target(tui, app_server, &target_session)
+        let prepared = match self
+            .prepare_target_session(
+                tui,
+                app_server,
+                &target_session,
+                super::resume_preparation::ResumeSource::Active,
+            )
             .await
         {
-            Ok(config) => config,
+            Ok(prepared) => prepared,
             Err(control) => return Ok(control),
         };
-        if let Err(error) = self.apply_runtime_policy_overrides(
-            &mut resume_config,
-            RuntimePolicyOverrideScope::ExplicitOnly,
-        ) {
-            self.add_session_picker_error(format!("{error:#}"));
+        self.activate_prepared_session(tui, app_server, prepared)
+            .await
+    }
+
+    pub(super) async fn activate_prepared_session(
+        &mut self,
+        tui: &mut tui::Tui,
+        app_server: &mut AppServerSession,
+        prepared: super::resume_preparation::PreparedResume,
+    ) -> Result<AppRunControl> {
+        let super::resume_preparation::PreparedResume {
+            backend_id,
+            config: resume_config,
+            local_settings,
+            thread: resumed,
+            read_only,
+            history_notice,
+            provider_error,
+        } = prepared;
+        if backend_id != app_server.backend_id() {
+            self.add_session_picker_error(
+                "This session belongs to a different backend. Open the session picker again."
+                    .to_string(),
+            );
             return Ok(AppRunControl::Continue);
         }
-        let permission_overrides = self.resume_permission_overrides(&resume_config);
-
-        if let Some(history_mode) = target_session.history_mode {
-            app_server.remember_thread_history_mode(target_session.thread_id, history_mode);
-        }
-        let resumed = app_server
-            .resume_thread_with_permission_overrides(
-                &local_settings,
-                resume_config.clone(),
-                target_session.thread_id,
-                self.resume_model_settings(),
-                permission_overrides,
-            )
-            .await;
-        let mut history_notice = None;
-        let (resumed, read_only) = match resumed {
-            Ok(resumed) => (resumed, false),
-            Err(err) if crate::app_server_session::is_active_writer_error(&err) => match app_server
-                .read_thread_for_viewing(&resume_config, &local_settings, target_session.thread_id)
-                .await
-            {
-                Ok((thread, notice)) => {
-                    history_notice = notice;
-                    (thread, true)
-                }
-                Err(read_err) => {
-                    self.add_session_picker_error(format!(
-                        "Failed to view thread open elsewhere: {read_err}"
-                    ));
-                    return Ok(AppRunControl::Continue);
-                }
-            },
-            Err(err) => {
-                let path_display = target_session.display_label();
-                self.add_session_picker_error(format!(
-                    "Failed to resume session from {path_display}: {err}"
-                ));
-                return Ok(AppRunControl::Continue);
-            }
-        };
         let resumed_thread_id = resumed.session.thread_id;
-        let retained_input = (self.chat_widget.is_external_writer_view()
+        let retained_input = ((self.chat_widget.is_external_writer_view()
+            || self.chat_widget.has_provider_error())
             && self.chat_widget.thread_id() == Some(resumed_thread_id))
         .then(|| self.chat_widget.capture_thread_input_state())
         .flatten();
@@ -1399,7 +1428,9 @@ impl App {
             .await
         {
             Ok(()) => {
-                if let Some(input) = retained_input {
+                if let Some(mut input) = retained_input {
+                    // A successful resume is the authority for clearing the old rejection.
+                    input.provider_error = None;
                     self.chat_widget.restore_thread_input_state(
                         Some(input),
                         ThreadInputStateRestoreMode {
@@ -1407,14 +1438,17 @@ impl App {
                         },
                     );
                 }
-                if read_only {
+                if let Some(error) = provider_error {
+                    self.chat_widget
+                        .show_provider_error(error, /*rejected_message_id*/ None);
+                } else if read_only {
                     self.ensure_thread_channel(resumed_thread_id)
                         .mark_external_writer();
                     self.chat_widget.show_external_writer_thread();
-                    if let Some(notice) = history_notice {
-                        self.chat_widget
-                            .add_info_message(notice.to_string(), /*hint*/ None);
-                    }
+                }
+                if let Some(notice) = history_notice {
+                    self.chat_widget
+                        .add_info_message(notice.to_string(), /*hint*/ None);
                 }
                 self.backfill_loaded_subagent_threads(app_server).await;
                 if matches!(
@@ -1444,11 +1478,7 @@ impl App {
                     .await;
                 }
             }
-            Err(err) => {
-                self.add_session_picker_error(format!(
-                    "Failed to attach to resumed app-server thread: {err}"
-                ));
-            }
+            Err(err) => return Err(err),
         }
 
         Ok(AppRunControl::Continue)
